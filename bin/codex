@@ -1,0 +1,9 @@
+#!/bin/bash
+
+# Omarchy 4.0.1 asks Codex for the removed `untrusted` approval policy.
+# Translate only that collector invocation; pass every other call through.
+if [[ $1 == "-s" && $2 == "read-only" && $3 == "-a" && $4 == "untrusted" ]]; then
+  set -- -s read-only -a never "${@:5}"
+fi
+
+exec "$HOME/.local/share/mise/installs/codex/latest/bin/codex" "$@"
