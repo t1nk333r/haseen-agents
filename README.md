@@ -148,3 +148,15 @@ One caveat on "all-time": the Codex collector only reads native session files
 touched in the last 30 days, and Fireworks requests the last 30 days from its
 billing API, so their totals and day counts cover that window. Claude's cover
 every transcript still on disk.
+
+## Merged-in upstreams
+
+This plugin absorbed two others (plan 090). Their code lives here now, but
+`claudes-eyes/forks.tsv` models one upstream per plugin and this plugin is not
+a fork of either — so neither is watched for drift automatically. Check them by
+hand when something here looks stale:
+
+| Merged from | Upstream | What came across |
+|---|---|---|
+| `t1nk33r.agent-usage` | https://github.com/robzolkos/omarchy-agent-usage | the pace signal (`paceDelta`), ported into `Panel.qml`. Its reset windows, countdowns and provider SVGs were already here and byte-identical, so nothing else was taken. Its 603-line copy of the packaged codex collector was dropped in favour of the 9-line `bin/codex` PATH shim, after verifying the packaged collector returns populated limits under it. |
+| `t1nk33r.codeburn` | https://github.com/erzz/omarchy-codeburn | `bin/codeburn-status` (vendored verbatim) and `SpendSection.qml`. Pins `codeburn@0.9.20`; a newer release may change the menubar JSON shape that `SpendSection.qml` parses. |
