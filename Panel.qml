@@ -4,10 +4,6 @@ import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
-// This plugin is a clone of the built-in omarchy.agents, so implicit
-// same-directory type resolution does not reach files added here. An explicit
-// directory import makes SpendSection.qml resolvable.
-import "." as Local
 
 Panel {
   id: root
@@ -17,27 +13,6 @@ Panel {
   moduleName: "t1nk33r.agents"
   ipcTarget: "t1nk33r.agents"
   manageIpc: false
-
-  // Where this plugin lives on disk, for the helper scripts under bin/.
-  readonly property string pluginDir:
-    Qt.resolvedUrl(".").toString().replace("file://", "").replace(/\/$/, "")
-
-  // Spend period for the codeburn section, persisted on this plugin's own
-  // shell.json entry so it survives a shell restart.
-  property string spendPeriod: root.settings
-    ? String(root.settings.spendPeriod || "today") : "today"
-
-  function persistSpendPeriod(periodId) {
-    root.spendPeriod = String(periodId || "today")
-    if (!root.bar || !root.bar.shell
-        || typeof root.bar.shell.updateEntryInline !== "function") return
-    var entry = {}
-    var current = root.settings || ({})
-    for (var k in current) entry[k] = current[k]
-    entry.id = root.moduleName
-    entry.spendPeriod = root.spendPeriod
-    root.bar.shell.updateEntryInline(root.moduleName, entry)
-  }
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
@@ -85,9 +60,6 @@ Panel {
 
   function refreshNow() {
     usage.refreshAll(true)
-    // Spend comes from a separate source, so it has to be asked separately.
-    // Guarded because the section only exists once the panel content is built.
-    root.fetchSpend()
   }
 
   function launchAgent() {
@@ -375,53 +347,7 @@ Panel {
     nowMs = Date.now()
     if (panelFlick) panelFlick.contentY = 0
     usage.refreshLimits()
-    root.fetchSpend()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
-  }
-
-  // Spend fetch. Deliberately here rather than inside SpendSection.qml: a
-  // Process declared in that file stopped the whole component from
-  // instantiating, silently — no QML error, no section, and a debug rectangle
-  // inside it never drew either. Panel.qml already imports Quickshell.Io and
-  // uses Process elsewhere, so the fetch lives here and the section is
-  // presentation only.
-  Process {
-    id: spendProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        spendSection.loading = false
-        var raw = String(text || "").trim()
-        if (raw === "") { spendSection.errorText = "codeburn returned nothing"; spendSection.report = null; return }
-        try {
-          var parsed = JSON.parse(raw)
-          if (parsed && parsed.error) {
-            spendSection.errorText = String(parsed.error); spendSection.report = null; return
-          }
-          spendSection.report = parsed
-          spendSection.errorText = ""
-        } catch (e) {
-          spendSection.errorText = "Could not parse codeburn output"
-          spendSection.report = null
-        }
-      }
-    }
-    stderr: StdioCollector { waitForEnd: true }
-    onExited: function(code) {
-      spendSection.loading = false
-      if (code !== 0 && spendSection.report === null && spendSection.errorText === "")
-        spendSection.errorText = "codeburn exited " + code
-    }
-  }
-
-  function fetchSpend() {
-    // onOpenedChanged fires before the panel content is built, so the section
-    // may not exist yet on the first open.
-    if (typeof spendSection === "undefined" || !spendSection) return
-    if (spendProc.running || root.pluginDir === "") return
-    spendSection.loading = true
-    spendProc.command = [root.pluginDir + "/bin/codeburn-status", root.spendPeriod]
-    spendProc.running = true
   }
 
   Main {
@@ -791,30 +717,6 @@ Panel {
                 share: modelData.total / Math.max(1, root.models[0].total)
               }
             }
-          }
-
-          // Spend, from codeburn — folded in when the three agent-telemetry
-          // plugins merged (plan 090). Its own file: a dollar figure from an
-          // npm tool is a different quantity from a different source than the
-          // rate-limit percentages above, and Panel.qml is long enough.
-          Local.SpendSection {
-            id: spendSection
-            width: parent.width
-            // This component imports QtQuick only — a plugin sub-file cannot
-            // import qs.*, it fails to instantiate silently — so every style
-            // value it needs is handed over explicitly from here.
-            foreground: root.foreground
-            dim: root.dim
-            accent: Color.accent
-            urgent: root.urgent
-            fontFamily: root.fontFamily
-            captionSize: Style.font.caption
-            displaySize: Style.font.display
-            gap: Style.space(6)
-            cornerRadius: Style.cornerRadius
-            period: root.spendPeriod
-            onPeriodPicked: function(periodId) { root.persistSpendPeriod(periodId); root.fetchSpend() }
-            onRefreshRequested: root.fetchSpend()
           }
 
           Text {
