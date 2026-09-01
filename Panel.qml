@@ -87,7 +87,7 @@ Panel {
     usage.refreshAll(true)
     // Spend comes from a separate source, so it has to be asked separately.
     // Guarded because the section only exists once the panel content is built.
-    if (typeof spendSection !== "undefined" && spendSection) spendSection.refresh()
+    root.fetchSpend()
   }
 
   function launchAgent() {
@@ -375,8 +375,53 @@ Panel {
     nowMs = Date.now()
     if (panelFlick) panelFlick.contentY = 0
     usage.refreshLimits()
-    if (typeof spendSection !== "undefined" && spendSection) spendSection.refresh()
+    root.fetchSpend()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
+  // Spend fetch. Deliberately here rather than inside SpendSection.qml: a
+  // Process declared in that file stopped the whole component from
+  // instantiating, silently — no QML error, no section, and a debug rectangle
+  // inside it never drew either. Panel.qml already imports Quickshell.Io and
+  // uses Process elsewhere, so the fetch lives here and the section is
+  // presentation only.
+  Process {
+    id: spendProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        spendSection.loading = false
+        var raw = String(text || "").trim()
+        if (raw === "") { spendSection.errorText = "codeburn returned nothing"; spendSection.report = null; return }
+        try {
+          var parsed = JSON.parse(raw)
+          if (parsed && parsed.error) {
+            spendSection.errorText = String(parsed.error); spendSection.report = null; return
+          }
+          spendSection.report = parsed
+          spendSection.errorText = ""
+        } catch (e) {
+          spendSection.errorText = "Could not parse codeburn output"
+          spendSection.report = null
+        }
+      }
+    }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: function(code) {
+      spendSection.loading = false
+      if (code !== 0 && spendSection.report === null && spendSection.errorText === "")
+        spendSection.errorText = "codeburn exited " + code
+    }
+  }
+
+  function fetchSpend() {
+    // onOpenedChanged fires before the panel content is built, so the section
+    // may not exist yet on the first open.
+    if (typeof spendSection === "undefined" || !spendSection) return
+    if (spendProc.running || root.pluginDir === "") return
+    spendSection.loading = true
+    spendProc.command = [root.pluginDir + "/bin/codeburn-status", root.spendPeriod]
+    spendProc.running = true
   }
 
   Main {
@@ -755,14 +800,21 @@ Panel {
           Local.SpendSection {
             id: spendSection
             width: parent.width
-            pluginDir: root.pluginDir
-            period: root.spendPeriod
+            // This component imports QtQuick only — a plugin sub-file cannot
+            // import qs.*, it fails to instantiate silently — so every style
+            // value it needs is handed over explicitly from here.
             foreground: root.foreground
             dim: root.dim
             accent: Color.accent
             urgent: root.urgent
             fontFamily: root.fontFamily
-            onPeriodPicked: function(periodId) { root.persistSpendPeriod(periodId) }
+            captionSize: Style.font.caption
+            displaySize: Style.font.display
+            gap: Style.space(6)
+            cornerRadius: Style.cornerRadius
+            period: root.spendPeriod
+            onPeriodPicked: function(periodId) { root.persistSpendPeriod(periodId); root.fetchSpend() }
+            onRefreshRequested: root.fetchSpend()
           }
 
           Text {
