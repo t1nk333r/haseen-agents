@@ -7,9 +7,33 @@ import qs.Ui
 
 Panel {
   id: root
-  moduleName: "omarchy.agents"
-  ipcTarget: "omarchy.agents"
+  // The fork carried the built-in's id: settings are injected by manifest id
+  // (t1nk33r.agents) but any write-back keys off moduleName, so persisting a
+  // setting would have landed on omarchy.agents' entry instead of this one.
+  moduleName: "t1nk33r.agents"
+  ipcTarget: "t1nk33r.agents"
   manageIpc: false
+
+  // Where this plugin lives on disk, for the helper scripts under bin/.
+  readonly property string pluginDir:
+    Qt.resolvedUrl(".").toString().replace("file://", "").replace(/\/$/, "")
+
+  // Spend period for the codeburn section, persisted on this plugin's own
+  // shell.json entry so it survives a shell restart.
+  property string spendPeriod: root.settings
+    ? String(root.settings.spendPeriod || "today") : "today"
+
+  function persistSpendPeriod(periodId) {
+    root.spendPeriod = String(periodId || "today")
+    if (!root.bar || !root.bar.shell
+        || typeof root.bar.shell.updateEntryInline !== "function") return
+    var entry = {}
+    var current = root.settings || ({})
+    for (var k in current) entry[k] = current[k]
+    entry.id = root.moduleName
+    entry.spendPeriod = root.spendPeriod
+    root.bar.shell.updateEntryInline(root.moduleName, entry)
+  }
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
@@ -57,6 +81,9 @@ Panel {
 
   function refreshNow() {
     usage.refreshAll(true)
+    // Spend comes from a separate source, so it has to be asked separately.
+    // Guarded because the section only exists once the panel content is built.
+    if (typeof spendSection !== "undefined" && spendSection) spendSection.refresh()
   }
 
   function launchAgent() {
@@ -87,6 +114,29 @@ Panel {
     if (minutes) return Number(minutes[1]) * 60 * 1000
     return 0
   }
+
+  // Pace, ported from t1nk33r.agent-usage when the three agent-telemetry
+  // plugins merged (plan 090). It was the one signal that plugin had and this
+  // one did not: a percentage says how much of the allowance is gone, pace says
+  // whether it is going faster than the window can refill. Burning 60% of a
+  // weekly limit is fine on day five and a problem on day two.
+  //
+  // agent-usage compared `weekly.remaining` against the fraction of the window
+  // still to run. The same comparison here uses windowSpanMs() for the window
+  // length, so it works for any labelled window rather than only the weekly one.
+  function paceDelta(window) {
+    if (!window) return 0
+    var span = windowSpanMs(window.label)
+    var remainingMs = resetMsFor(window)
+    if (span <= 0 || remainingMs <= 0) return 0
+    var expectedRemaining = clamp(remainingMs / span, 0, 1)
+    var actualRemaining = clamp(1 - window.percent, 0, 1)
+    return actualRemaining - expectedRemaining
+  }
+
+  // A small tolerance, so a window sitting exactly on pace does not flicker
+  // between "ahead" and "behind" as the countdown ticks.
+  function behindPace(window) { return paceDelta(window) < -0.0005 }
 
   function windowTitle(label) {
     var text = String(label || "").toLowerCase()
@@ -307,6 +357,7 @@ Panel {
     nowMs = Date.now()
     if (panelFlick) panelFlick.contentY = 0
     usage.refreshLimits()
+    if (typeof spendSection !== "undefined" && spendSection) spendSection.refresh()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
@@ -679,6 +730,23 @@ Panel {
             }
           }
 
+          // Spend, from codeburn — folded in when the three agent-telemetry
+          // plugins merged (plan 090). Its own file: a dollar figure from an
+          // npm tool is a different quantity from a different source than the
+          // rate-limit percentages above, and Panel.qml is long enough.
+          SpendSection {
+            id: spendSection
+            width: parent.width
+            pluginDir: root.pluginDir
+            period: root.spendPeriod
+            foreground: root.foreground
+            dim: root.dim
+            accent: Color.accent
+            urgent: root.urgent
+            fontFamily: root.fontFamily
+            onPeriodPicked: function(periodId) { root.persistSpendPeriod(periodId) }
+          }
+
           Text {
             visible: text !== ""
             width: parent.width
@@ -747,9 +815,14 @@ Panel {
       width: parent.width
       text: {
         var remainingMs = root.resetMsFor(limitRow.window)
-        return remainingMs > 0 ? "Resets in " + root.formatDuration(remainingMs) : ""
+        if (remainingMs <= 0) return ""
+        var base = "Resets in " + root.formatDuration(remainingMs)
+        var delta = root.paceDelta(limitRow.window)
+        if (delta === 0) return base
+        return base + "  ·  " + Math.abs(Math.round(delta * 100)) + "% "
+             + (delta < 0 ? "behind pace" : "ahead of pace")
       }
-      color: root.dim
+      color: root.behindPace(limitRow.window) ? root.urgent : root.dim
       font.family: root.fontFamily
       font.pixelSize: Style.font.caption
     }

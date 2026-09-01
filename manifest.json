@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "t1nk33r.agents",
   "name": "My Agents",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "author": "t1nk33r",
   "license": "MIT",
-  "description": "Claude Code, Codex, and Fireworks usage, limits, and pace in a native Omarchy bar panel.",
+  "description": "Claude, Codex and Fireworks usage, limits, pace and spend in one native Omarchy bar panel. Merges the former t1nk33r.agent-usage and t1nk33r.codeburn plugins (plan 090).",
   "kinds": [
     "bar-widget"
   ],
@@ -34,11 +34,12 @@
           "enabled": true
         }
       },
-      "refreshIntervalSec": 900,
+      "refreshIntervalSec": 300,
       "syncMode": "Off",
       "syncDir": "",
       "syncFileName": "",
-      "syncDeviceId": ""
+      "syncDeviceId": "",
+      "spendPeriod": "today"
     },
     "schema": [
       {
