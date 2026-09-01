@@ -4,6 +4,10 @@ import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
+// This plugin is a clone of the built-in omarchy.agents, so implicit
+// same-directory type resolution does not reach files added here. An explicit
+// directory import makes SpendSection.qml resolvable.
+import "." as Local
 
 Panel {
   id: root
@@ -126,7 +130,17 @@ Panel {
   // length, so it works for any labelled window rather than only the weekly one.
   function paceDelta(window) {
     if (!window) return 0
+    // windowSpanMs only reads a duration out of labels that carry digits
+    // ("5h window", "30m window"). The weekly and monthly windows are spelled
+    // in words ("Weekly", "Fable Weekly"), so it returned 0 for exactly the
+    // windows pace matters most for. Fall back to the shape windowIsLong
+    // already recognises.
+    var label = String(window.label || "").toLowerCase()
     var span = windowSpanMs(window.label)
+    if (span <= 0 && windowIsLong(label))
+      span = (label.indexOf("month") >= 0 || label.indexOf("30-day") >= 0)
+        ? 30 * 24 * 3600 * 1000
+        : 7 * 24 * 3600 * 1000
     var remainingMs = resetMsFor(window)
     if (span <= 0 || remainingMs <= 0) return 0
     var expectedRemaining = clamp(remainingMs / span, 0, 1)
@@ -155,7 +169,11 @@ Panel {
     return {
       title: String(title || "") !== "" ? String(title) : windowTitle(label),
       percent: Number(percent),
-      resetAt: String(resetAt || "")
+      resetAt: String(resetAt || ""),
+      // The raw label is kept, not just the display title: paceDelta needs the
+      // window's length, and only the label carries it ("Session (5-hour)",
+      // "Weekly (7-day)"). windowTitle() flattens both to a word.
+      label: String(label || "")
     }
   }
 
@@ -734,7 +752,7 @@ Panel {
           // plugins merged (plan 090). Its own file: a dollar figure from an
           // npm tool is a different quantity from a different source than the
           // rate-limit percentages above, and Panel.qml is long enough.
-          SpendSection {
+          Local.SpendSection {
             id: spendSection
             width: parent.width
             pluginDir: root.pluginDir
