@@ -1,11 +1,23 @@
 # Agents
 
-One bar icon and one panel for every AI coding subscription on the machine.
+A [haseen](https://github.com/t1nk333r/haseen) plugin (also runs on Omarchy):
+one bar icon and one panel for every AI coding subscription on the machine.
 The panel is strictly a display: it watches the usage records that
 `omarchy-agent-usage-update` writes to `~/.local/state/omarchy/agents/usage/`
 and draws whatever appears there. `Panel.qml` owns the bar button and the
 popup; `Main.qml` discovers and watches the records (and handles the optional
 cross-device aggregation); `Agent.qml` is the per-record file watcher.
+
+## Install
+
+On [haseen](https://github.com/t1nk333r/haseen):
+
+```bash
+haseen plugin install https://github.com/t1nk333r/haseen-agents
+```
+
+Also runs on Omarchy: clone it into `~/.config/omarchy/plugins/` and enable
+it with `omarchy plugin enable`.
 
 ## Panel
 
