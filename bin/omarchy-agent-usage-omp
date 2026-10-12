@@ -1,0 +1,886 @@
+#!/usr/bin/python3
+# omarchy:summary=Print the Oh My Pi (omp) usage record as JSON
+# omarchy:args=[--force] [--limits-only] [--write]
+# omarchy:hidden=true
+"""Collect Oh My Pi (omp) limits and local usage into one display-ready record.
+
+Oh My Pi is a harness, not a subscription: the limits it reports belong to the
+upstream accounts it is signed in to (Codex, Claude, ...), and its local usage
+lives in its own stats database. Both halves come from omp itself — `omp usage
+--json` for the limits and `omp stats --json` to sync session files, followed
+by read-only `~/.omp/stats.db` aggregates for all-time model totals, per-day
+history, prompts and sessions. The CLI's recent-window JSON never replaces
+full history. The panel only ever reads the JSON this prints.
+
+The same collector also serves one upstream on its own: bin/omarchy-agent-
+usage-claude runs it with the CLAUDE profile, which keeps only omp's Anthropic
+reports and the Anthropic rows of stats.db. stats.db has no account column, so
+that record's history is the sum over every Claude account omp has used; its
+limits stay one row per account and window.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any, NamedTuple
+
+
+class Profile(NamedTuple):
+  """Which record this run writes and which upstream it keeps ("" = all)."""
+  agent_id: str
+  name: str
+  provider: str
+
+
+OMP = Profile("omp", "Oh My Pi", "")
+CLAUDE = Profile("claude", "Claude (OMP)", "anthropic")
+
+# The widget runs this on its refresh timer, so every omp call is bounded:
+# a hung provider endpoint must never hold the panel's update run open.
+LIMITS_TIMEOUT_SECONDS = 20
+STATS_TIMEOUT_SECONDS = 60
+CONFIG_TIMEOUT_SECONDS = 10
+PROBE_MIN_INTERVAL_SECONDS = 20
+
+# usageStatusText carries the local-stats gap; the prefix lets a later
+# --limits-only run carry that sentence forward without re-deriving it.
+STATS_UNAVAILABLE_PREFIX = "Local stats unavailable"
+
+EXIT_OK = 0
+EXIT_OMP_MISSING = 2
+EXIT_NO_SOURCES = 3
+EXIT_WRITE_FAILED = 4
+
+# A limit whose status means "nothing was measured" is skipped rather than
+# drawn as a zero allowance. Everything else is shown as reported.
+NO_DATA_STATUSES = frozenset({
+  "unknown",
+  "unavailable",
+  "not_available",
+  "not-available",
+  "no_data",
+  "nodata",
+  "none",
+  "null",
+  "error",
+  "failed",
+  "failure",
+  "missing",
+  "pending",
+  "stale",
+  "expired",
+  "disabled",
+  "unsupported",
+})
+
+# Names for the upstreams omp reports limits for. An unknown provider keeps a
+# readable form of its own id rather than disappearing.
+PROVIDER_NAMES = {
+  "anthropic": "Claude",
+  "openai-codex": "Codex",
+  "openai": "OpenAI",
+  "deepseek": "DeepSeek",
+  "google": "Google",
+  "gemini": "Gemini",
+  "kimi-code": "Kimi",
+  "moonshot": "Moonshot",
+  "xai": "Grok",
+  "zai": "Z.ai",
+  "mistral": "Mistral",
+  "groq": "Groq",
+  "openrouter": "OpenRouter",
+}
+
+# Window ids are short and stable ("5h", "7d", "30d"); the panel reads window
+# length back out of the label it is handed (WindowSpanMs in Panel.qml), so the
+# label spells the window the way that parser expects.
+WINDOW_UNITS = (
+  (re.compile(r"^(\d+)h$"), "{n}-hour"),
+  (re.compile(r"^(\d+)d$"), "{n}-day"),
+  (re.compile(r"^(\d+)w$"), "{n}-week"),
+  (re.compile(r"^(\d+)m$"), "{n}-minute"),
+)
+
+TRANSIENT_ERROR = re.compile(
+  r"timeout|timed out|network|socket|connect|enotfound|eai_again|econnrefused|econnreset|etimedout|"
+  r"fetch failed|proxy|tls|dns|offline|unreachable",
+  re.IGNORECASE,
+)
+
+STATS_KEYS = (
+  "todayPrompts",
+  "todaySessions",
+  "todayTotalTokens",
+  "todayTokensByModel",
+  "recentDays",
+  "totalPrompts",
+  "totalSessions",
+  "activeDays",
+  "activeDates",
+  "modelUsage",
+)
+
+
+
+# ------------------------------------------------------------------ plumbing
+
+
+def state_dir() -> Path:
+  return Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+
+
+def usage_dir() -> Path:
+  return state_dir() / "haseen" / "agents" / "usage"
+
+
+def record_path(profile: Profile) -> Path:
+  return usage_dir() / f"{profile.agent_id}.json"
+
+
+def cache_root() -> Path:
+  root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "haseen" / "agents" / "agent-usage"
+  root.mkdir(parents=True, exist_ok=True)
+  return root
+
+
+def limits_cache_path(profile: Profile) -> Path:
+  # One cache per scope, so an all-provider probe never answers a Claude-only
+  # run (or the reverse). The name changed with the per-account rows: the old
+  # omp-limits.json holds windows merged across accounts and is never read.
+  return cache_root() / f"omp-limits-{profile.provider or 'all'}.json"
+
+
+def run(command: list[str], timeout: float) -> tuple[int, str, str]:
+  """Run one omp call, bounded. 124 is the conventional timeout exit code."""
+  try:
+    proc = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+    return proc.returncode, proc.stdout or "", proc.stderr or ""
+  except subprocess.TimeoutExpired:
+    return 124, "", f"{command[0]} {command[1]} timed out after {timeout:g}s"
+  except OSError as exc:
+    return 127, "", f"{command[0]}: {exc}"
+
+
+def find_omp() -> str | None:
+  found = shutil.which("omp")
+  if found:
+    return found
+  # The widget's PATH is the session's, which does not necessarily carry the
+  # mise shims that put `omp` there for a shell — the `bin/codex` shim beside
+  # this collector exists for the same reason. `omp config path` is asked once
+  # the binary is found, so the fallback list stays a short guess.
+  installs = Path.home() / ".local/share/mise/installs/github-can1357-oh-my-pi"
+  candidates = [installs / "latest" / "omp", Path.home() / ".local/bin/omp"]
+  candidates.extend(sorted(installs.glob("*/omp")))
+  for candidate in candidates:
+    if candidate.is_file() and os.access(candidate, os.X_OK):
+      return str(candidate)
+  return None
+
+
+def omp_home(omp: str) -> Path:
+  """The directory holding omp's stats.db.
+
+  `omp config path` answers with omp's own agent directory, so its parent is
+  the home the database lives in; an install that has moved (XDG layouts) is
+  followed rather than guessed at, with ~/.omp as the documented default.
+  """
+  code, out, _ = run([omp, "config", "path"], CONFIG_TIMEOUT_SECONDS)
+  candidates: list[Path] = []
+  if code == 0:
+    for line in out.splitlines():
+      line = line.strip()
+      if line.startswith("/"):
+        resolved = Path(line)
+        candidates.extend([resolved, resolved.parent])
+        break
+  candidates.append(Path.home() / ".omp")
+  for candidate in candidates:
+    if (candidate / "stats.db").is_file():
+      return candidate
+  return candidates[-1]
+
+
+def extract_json(text: str) -> Any | None:
+  """Pull the JSON document out of a stdout stream that may carry a preamble.
+
+  `omp stats --json` prints "Synced N new entries from M files" (and similar
+  progress lines) before the document, so a straight pipe into a parser fails.
+  Every "{" starts a balanced-brace candidate, and each candidate is offered to
+  the parser: a stray brace in a log line cannot break the read. The document is
+  by far the largest object on the stream, so the longest candidate that parses
+  wins — an incidental object in the progress lines or a trailing log line
+  cannot take its place.
+  """
+  best: Any | None = None
+  best_length = 0
+  for start in [index for index, char in enumerate(text) if char == "{"]:
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+      char = text[index]
+      if in_string:
+        if escaped:
+          escaped = False
+        elif char == "\\":
+          escaped = True
+        elif char == '"':
+          in_string = False
+        continue
+      if char == '"':
+        in_string = True
+      elif char == "{":
+        depth += 1
+      elif char == "}":
+        depth -= 1
+        if depth == 0:
+          length = index + 1 - start
+          if length > best_length:
+            try:
+              best = json.loads(text[start:index + 1])
+              best_length = length
+            except Exception:
+              pass
+          break
+  return best
+
+
+def read_json(path: Path) -> Any | None:
+  try:
+    with path.open("r", encoding="utf-8") as handle:
+      return json.load(handle)
+  except Exception:
+    return None
+
+
+def write_json(path: Path, value: Any) -> None:
+  # mkstemp opens at 0600; these caches were world-readable before.
+  handle, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+  try:
+    with os.fdopen(handle, "w", encoding="utf-8") as fh:
+      json.dump(value, fh, separators=(",", ":"), sort_keys=True)
+      fh.write("\n")
+    os.replace(tmp, path)
+  except Exception:
+    try:
+      os.unlink(tmp)
+    except OSError:
+      pass
+    raise
+
+
+def number(value: Any, default: float = 0.0) -> float:
+  try:
+    parsed = float(value)
+  except (TypeError, ValueError):
+    return default
+  return parsed if parsed == parsed and parsed not in (float("inf"), float("-inf")) else default
+
+
+def whole(value: Any) -> int:
+  return int(round(number(value)))
+
+
+def iso_from_ms(value: Any) -> str:
+  """omp reports epoch milliseconds; the records carry ISO-8601 strings."""
+  ms = number(value, 0.0)
+  if ms <= 0:
+    return ""
+  try:
+    return dt.datetime.fromtimestamp(ms / 1000.0, dt.timezone.utc).isoformat()
+  except (OverflowError, OSError, ValueError):
+    return ""
+
+
+def window_is_open(resets_at: str, now: dt.datetime) -> bool:
+  """A cached percentage stops describing anything once its window has reset."""
+  if resets_at == "":
+    return True
+  try:
+    parsed = dt.datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
+  except ValueError:
+    return True
+  if parsed.tzinfo is None:
+    parsed = parsed.replace(tzinfo=dt.timezone.utc)
+  return parsed > now
+
+
+# -------------------------------------------------------------------- limits
+
+
+def humanise(text: str) -> str:
+  words = [word for word in re.split(r"[^A-Za-z0-9]+", text) if word]
+  return " ".join(word[:1].upper() + word[1:] for word in words)
+
+
+def provider_name(provider: str) -> str:
+  return PROVIDER_NAMES.get(provider) or humanise(provider) or provider
+
+
+def window_text(limit: dict[str, Any]) -> str:
+  window = limit.get("window") if isinstance(limit.get("window"), dict) else {}
+  scope = limit.get("scope") if isinstance(limit.get("scope"), dict) else {}
+  for raw in (window.get("id"), scope.get("windowId")):
+    text = str(raw or "").strip()
+    for pattern, template in WINDOW_UNITS:
+      match = pattern.match(text)
+      if match:
+        return template.format(n=match.group(1))
+  for raw in (window.get("label"), limit.get("label")):
+    text = str(raw or "").strip()
+    if text:
+      return text
+  return "Limit"
+
+
+def report_metadata(report: dict[str, Any]) -> dict[str, Any]:
+  return report.get("metadata") if isinstance(report.get("metadata"), dict) else {}
+
+
+def report_provider(report: dict[str, Any]) -> str:
+  return str(report.get("provider") or "").strip()
+
+
+def account_identity(report: dict[str, Any]) -> tuple[str, str, str] | None:
+  """The identity that proves two reports describe one subscription.
+
+  An account id (with its organisation, when omp reports one) is stable; an
+  email or a display name is not proof, so a report without an account id is
+  never taken for another one.
+  """
+  metadata = report_metadata(report)
+  account_id = str(metadata.get("accountId") or "").strip()
+  if account_id == "":
+    return None
+  return report_provider(report), account_id, str(metadata.get("orgId") or "").strip()
+
+
+def distinct_reports(payload: Any, provider: str) -> list[dict[str, Any]]:
+  """omp's reports for the profile's provider(s), one per proven account.
+
+  Each report is its own account's allowance. omp's `scope.shared` says a
+  window is shared across that account's models, not across accounts, so two
+  accounts are never merged or summed; only a repeat of one proven identity
+  collapses, to its most recently fetched report.
+  """
+  if not isinstance(payload, dict) or not isinstance(payload.get("reports"), list):
+    return []
+  kept: list[dict[str, Any]] = []
+  seen: dict[tuple[str, str, str], int] = {}
+  for report in payload["reports"]:
+    if not isinstance(report, dict) or report_provider(report) == "":
+      continue
+    if provider and report_provider(report) != provider:
+      continue
+    identity = account_identity(report)
+    if identity is None:
+      kept.append(report)
+    elif identity not in seen:
+      seen[identity] = len(kept)
+      kept.append(report)
+    elif number(report.get("fetchedAt")) > number(kept[seen[identity]].get("fetchedAt")):
+      kept[seen[identity]] = report
+  return kept
+
+
+def tag_candidates(report: dict[str, Any]) -> list[str]:
+  """Ever more specific names for one account, shortest first."""
+  metadata = report_metadata(report)
+  email = str(metadata.get("email") or "").strip()
+  short_id = str(metadata.get("accountId") or "").strip()[:8]
+  org = str(metadata.get("orgName") or "").strip() or str(metadata.get("orgId") or "").strip()[:8]
+  local = email.split("@", 1)[0] if email else short_id
+  full = email or short_id
+  with_org = f"{full}/{org}" if org else full
+  with_id = f"{with_org} #{short_id}" if short_id else with_org
+  return [local, full, with_org, with_id]
+
+
+def account_tags(reports: list[dict[str, Any]]) -> list[str]:
+  """Per report, the account tag its rows carry ("" for a provider's only account).
+
+  Every row of a provider with several accounts is tagged, with the shortest
+  name that tells that provider's accounts apart: two addresses sharing a
+  local part fall back to the full address, one address in two organisations
+  to the organisation, and so on.
+  """
+  tags = [""] * len(reports)
+  by_provider: dict[str, list[int]] = {}
+  for index, report in enumerate(reports):
+    by_provider.setdefault(report_provider(report), []).append(index)
+  for indices in by_provider.values():
+    if len(indices) < 2:
+      continue
+    candidates = [tag_candidates(reports[index]) for index in indices]
+    chosen = None
+    for level in range(len(candidates[0])):
+      names = [candidate[level] for candidate in candidates]
+      if all(names) and len(set(names)) == len(names):
+        chosen = names
+        break
+    if chosen is None:
+      chosen = [f"{candidate[-1] or 'account'} #{ordinal}" for ordinal, candidate in enumerate(candidates, 1)]
+    for index, name in zip(indices, chosen):
+      tags[index] = name
+  return tags
+
+
+# Slots omp names a limit by that say nothing about what it covers; a provider
+# with several of them is told apart by the window or the account, not by
+# "primary".
+SLOT_NAMES = frozenset({"primary", "secondary", "tertiary", "quaternary", "main", "default", "account"})
+
+
+def scope_tag(limit: dict[str, Any], provider: str, window_id: str) -> str:
+  """What a limit covers beyond its provider and window, if anything.
+
+  Anthropic reports a second seven-day allowance scoped to one model
+  (`anthropic:7d:fable`) beside the account-wide one, and omp spells that scope
+  in the limit's own label ("Claude 7 Day (Fable)"). That parenthetical is the
+  cleanest source; a scope left only in the id is used when there is none.
+  """
+  match = re.search(r"\(([^)]+)\)", str(limit.get("label") or ""))
+  if match:
+    return humanise(match.group(1))
+  parts = [part for part in str(limit.get("id") or "").split(":") if part]
+  parts = [part for part in parts if part not in (provider, window_id) and part.lower() not in SLOT_NAMES]
+  return humanise(" ".join(parts))
+
+
+def limit_rows(reports: list[dict[str, Any]]) -> list[dict[str, Any]]:
+  """Flatten the per-account reports into the record's flat limits list.
+
+  Every account keeps its own row per window, with its own percentage and
+  reset time; rows of one window stay next to each other, and a provider with
+  several accounts tags each of its rows with the account (account_tags).
+  """
+  tags = account_tags(reports)
+  groups: dict[str, list[dict[str, Any]]] = {}
+  for report, account in zip(reports, tags):
+    provider = report_provider(report)
+    for limit in report.get("limits") or []:
+      if not isinstance(limit, dict):
+        continue
+      if str(limit.get("status") or "").lower() in NO_DATA_STATUSES:
+        continue
+      amount = limit.get("amount") if isinstance(limit.get("amount"), dict) else {}
+      fraction = number(amount.get("usedFraction"), -1.0)
+      if fraction < 0:
+        continue
+      scope = limit.get("scope") if isinstance(limit.get("scope"), dict) else {}
+      window = limit.get("window") if isinstance(limit.get("window"), dict) else {}
+      window_id = str(window.get("id") or scope.get("windowId") or "").strip()
+      scope_text = scope_tag(limit, provider, window_id)
+      key = "\x1f".join([provider, window_id or window_text(limit), scope_text])
+      groups.setdefault(key, []).append({
+        "provider": provider,
+        "window": window_text(limit),
+        "scope": scope_text,
+        "account": account,
+        # percent is a 0-1 fraction: the panel alarms at >= 0.9 and measures
+        # the meter as 1 - percent.
+        "percent": min(max(fraction, 0.0), 1.0),
+        "resetsAt": iso_from_ms(window.get("resetsAt")),
+      })
+
+  rows: list[dict[str, Any]] = []
+  for entries in groups.values():
+    for entry in entries:
+      label = f"{provider_name(entry['provider'])} · {entry['window']}"
+      if entry["scope"]:
+        label += f" ({entry['scope']})"
+      if entry["account"]:
+        label += f" ({entry['account']})"
+      rows.append({
+        "label": label,
+        "title": label,
+        "percent": round(entry["percent"], 6),
+        "resetsAt": entry["resetsAt"],
+      })
+  return rows
+
+
+def usable_cached_limits(cached: Any) -> list[dict[str, Any]]:
+  if not isinstance(cached, dict) or not isinstance(cached.get("limits"), list):
+    return []
+  now = dt.datetime.now(dt.timezone.utc)
+  rows = []
+  for entry in cached["limits"]:
+    if not isinstance(entry, dict):
+      continue
+    if not window_is_open(str(entry.get("resetsAt") or ""), now):
+      continue
+    rows.append({
+      "label": str(entry.get("label") or ""),
+      "title": str(entry.get("title") or entry.get("label") or ""),
+      "percent": round(number(entry.get("percent"), 0.0), 6),
+      "resetsAt": str(entry.get("resetsAt") or ""),
+    })
+  return [row for row in rows if row["label"] != ""]
+
+
+def no_usage_help(payload: dict[str, Any], profile: Profile) -> str:
+  pending = payload.get("accountsWithoutUsage")
+  names = []
+  for report in distinct_reports(payload, profile.provider):
+    names.append(provider_name(report_provider(report)))
+  if isinstance(pending, list):
+    for account in pending:
+      if not isinstance(account, dict) or not account.get("provider"):
+        continue
+      if profile.provider and str(account["provider"]) != profile.provider:
+        continue
+      names.append(provider_name(str(account["provider"])))
+  if names:
+    return "Signed in to " + ", ".join(sorted(set(names))) + " but no usage reported yet."
+  if profile.provider:
+    return f"No {provider_name(profile.provider)} account is signed in to Oh My Pi — limits appear once one is."
+  return "No provider is signed in to Oh My Pi — limits appear once one is."
+
+
+def collect_limits(
+  omp: str, force: bool, cache_seconds: float, profile: Profile,
+) -> tuple[list[dict[str, Any]], int, str, bool]:
+  """Return (limit rows, accounts reporting, auth help text, retry advised)."""
+  cached = read_json(limits_cache_path(profile))
+  fallback = usable_cached_limits(cached)
+  cached_accounts = whole(cached.get("accounts")) if isinstance(cached, dict) else 0
+  # A panel opened and shut repeatedly must not become a request per flick.
+  # --force is a person asking for fresh numbers and skips the reuse window.
+  if fallback and not force and isinstance(cached, dict):
+    fetched_at = number(cached.get("fetchedAtMs"), 0.0)
+    if time.time() * 1000 - fetched_at < cache_seconds * 1000:
+      return fallback, cached_accounts, "", False
+
+  code, out, err = run([omp, "usage", "--json"], LIMITS_TIMEOUT_SECONDS)
+  payload = extract_json(out) if code == 0 else None
+  if isinstance(payload, dict) and isinstance(payload.get("reports"), list):
+    reports = distinct_reports(payload, profile.provider)
+    rows = limit_rows(reports)
+    write_json(limits_cache_path(profile),
+               {"fetchedAtMs": round(time.time() * 1000), "limits": rows, "accounts": len(reports)})
+    return rows, len(reports), "" if rows else no_usage_help(payload, profile), False
+
+  reason = (err.strip().splitlines() or [""])[-1]
+  if code != 0 and reason == "":
+    reason = f"omp usage exited {code}"
+  help_text = "Oh My Pi could not read provider limits"
+  help_text += f" ({reason})" if reason else ""
+  help_text += " — showing the last numbers whose window has not reset. Run `omp usage` in a terminal for the error."
+  # The first probe after login often fires before the network is up; ask the
+  # shell to try again sooner than its regular interval.
+  return fallback, cached_accounts if fallback else 0, help_text, bool(TRANSIENT_ERROR.search(err))
+
+
+# --------------------------------------------------------------------- stats
+
+
+def written_by(previous: Any, profile: Profile) -> bool:
+  """Whether a record on disk came from this collector and profile.
+
+  claude.json was Claude Code's record before this collector took the id over;
+  its numbers describe a different source and are never carried forward.
+  """
+  return isinstance(previous, dict) and previous.get("id") == profile.agent_id and previous.get("name") == profile.name
+
+
+def read_fresh_stats(previous: Any, profile: Profile) -> dict[str, Any] | None:
+  """--limits-only reuses the statistics already on disk.
+
+  Local stats only move when omp's session files are re-read, which is what
+  the full run does; a limits refresh carries the previous numbers forward
+  instead of writing zeros over them.
+  """
+  if not written_by(previous, profile) or previous.get("hasLocalStats") is not True:
+    return None
+  return {key: previous.get(key) for key in STATS_KEYS}
+
+
+def carried_stats_text(previous: Any, profile: Profile) -> str:
+  if written_by(previous, profile):
+    text = str(previous.get("usageStatusText") or "")
+    if text.startswith(STATS_UNAVAILABLE_PREFIX):
+      return text
+  return f"{STATS_UNAVAILABLE_PREFIX}: not scanned yet (limits-only run)"
+
+
+def empty_stats() -> dict[str, Any]:
+  return {
+    "todayPrompts": 0,
+    "todaySessions": 0,
+    "todayTotalTokens": 0,
+    "todayTokensByModel": {},
+    "recentDays": [],
+    "totalPrompts": 0,
+    "totalSessions": 0,
+    "activeDays": 0,
+    "activeDates": [],
+    "modelUsage": {},
+  }
+
+
+def local_dates() -> tuple[int, int]:
+  """Epoch-millisecond bounds of the local day, the same clock stats.db uses."""
+  today = dt.datetime.now().date()
+  start = int(dt.datetime.combine(today, dt.time.min).timestamp() * 1000)
+  end = int(dt.datetime.combine(today + dt.timedelta(days=1), dt.time.min).timestamp() * 1000)
+  return start, end
+
+
+def recent_date_strings() -> list[str]:
+  today = dt.datetime.now().date()
+  return [(today - dt.timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(6, -1, -1)]
+
+
+def stats_from_db(home: Path, provider: str) -> tuple[dict[str, Any] | None, str]:
+  """Derive full history, model buckets, prompts and sessions from stats.db.
+
+  `omp stats --json` first synchronises the database, but its JSON model buckets
+  cover only a recent window. Reading all historical fields from the database
+  prevents older models from disappearing when that recent window moves.
+
+  A non-empty provider keeps that provider's rows only. stats.db records the
+  provider but not the account, so those numbers are the provider's total over
+  every account omp has used; a prompt omp stored without a provider counts
+  in the all-provider numbers only.
+  """
+  database = home / "stats.db"
+  if not database.is_file():
+    return None, f"{database} not found"
+  try:
+    connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=5)
+  except sqlite3.Error as exc:
+    return None, f"cannot read {database}: {exc}"
+  try:
+    start, end = local_dates()
+    # Every query takes the same (provider, provider) filter pair.
+    scope = "(? = '' OR provider = ?)"
+    only = (provider, provider)
+    sessions_today, tokens_today = connection.execute(
+      "SELECT COUNT(DISTINCT session_file), COALESCE(SUM(total_tokens), 0)"
+      f" FROM messages WHERE timestamp >= ? AND timestamp < ? AND {scope}", (start, end, *only)).fetchone()
+    prompts_today = connection.execute(
+      f"SELECT COUNT(*) FROM user_messages WHERE timestamp >= ? AND timestamp < ? AND {scope}",
+      (start, end, *only)).fetchone()[0]
+    tokens_today_by_model = {
+      str(model): whole(tokens)
+      for model, tokens in connection.execute(
+        "SELECT model, COALESCE(SUM(total_tokens), 0) FROM messages"
+        f" WHERE timestamp >= ? AND timestamp < ? AND {scope} GROUP BY model", (start, end, *only))
+    }
+    total_sessions = connection.execute(
+      f"SELECT COUNT(DISTINCT session_file) FROM messages WHERE {scope}", only).fetchone()[0]
+    total_prompts = connection.execute(f"SELECT COUNT(*) FROM user_messages WHERE {scope}", only).fetchone()[0]
+    recent = {day: 0 for day in recent_date_strings()}
+    active_dates = []
+    for day, tokens in connection.execute(
+      "SELECT date(timestamp / 1000, 'unixepoch', 'localtime') AS day,"
+      f" COALESCE(SUM(total_tokens), 0) FROM messages WHERE {scope} GROUP BY day", only):
+      day = str(day or "")
+      if day == "":
+        continue
+      active_dates.append(day)
+      if day in recent:
+        # recentDays.messageCount is a token total, despite the legacy name it
+        # shares with synced snapshots.
+        recent[day] = whole(tokens)
+    model_usage: dict[str, dict[str, int]] = {}
+    for model, input_tokens, output_tokens, cache_read, cache_write in connection.execute(
+      "SELECT model, COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),"
+      " COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_write_tokens), 0)"
+      f" FROM messages WHERE {scope} GROUP BY model", only):
+      model_usage[str(model)] = {
+        "inputTokens": whole(input_tokens),
+        "outputTokens": whole(output_tokens),
+        "cacheReadInputTokens": whole(cache_read),
+        "cacheCreationInputTokens": whole(cache_write),
+      }
+  except sqlite3.Error as exc:
+    return None, f"cannot read {database}: {exc}"
+  finally:
+    connection.close()
+
+  return {
+    "todayPrompts": whole(prompts_today),
+    "todaySessions": whole(sessions_today),
+    "todayTotalTokens": whole(tokens_today),
+    "todayTokensByModel": tokens_today_by_model,
+    "recentDays": [{"date": day, "messageCount": recent[day]} for day in recent],
+    "totalPrompts": whole(total_prompts),
+    "totalSessions": whole(total_sessions),
+    "activeDays": len(active_dates),
+    "activeDates": sorted(active_dates),
+    "modelUsage": model_usage,
+  }, ""
+
+
+def collect_stats(omp: str, provider: str) -> tuple[dict[str, Any], str]:
+  """Return (stats fields, problem text); problem text means "no local stats"."""
+  # `omp stats` first: it syncs the session files into stats.db, so the day and
+  # prompt queries below see the session that is running right now.
+  run([omp, "stats", "--json"], STATS_TIMEOUT_SECONDS)
+  stats, problem = stats_from_db(omp_home(omp), provider)
+  if stats is None:
+    return empty_stats(), f"{STATS_UNAVAILABLE_PREFIX}: {problem}"
+  return stats, ""
+
+
+# -------------------------------------------------------------------- record
+
+
+def remove_record(profile: Profile) -> None:
+  """Drop a record left behind by an Oh My Pi that is no longer installed.
+
+  The panel draws a tab for any record in the usage directory and nothing in
+  it expires, so a record nobody can refresh would sit there forever with
+  numbers that stopped being true the day omp was removed.
+  """
+  try:
+    record_path(profile).unlink()
+  except FileNotFoundError:
+    pass
+  except OSError as exc:
+    print(f"omarchy-agent-usage-{profile.agent_id}: cannot remove {record_path(profile)}: {exc}", file=sys.stderr)
+
+
+def write_record(record: dict[str, Any], profile: Profile) -> None:
+  directory = usage_dir()
+  directory.mkdir(parents=True, exist_ok=True)
+  handle, tmp = tempfile.mkstemp(dir=directory, prefix=f".{profile.agent_id}.")
+  try:
+    with os.fdopen(handle, "w", encoding="utf-8") as fh:
+      json.dump(record, fh, separators=(",", ":"), sort_keys=True)
+      fh.write("\n")
+      fh.flush()
+      os.fsync(fh.fileno())
+    os.replace(tmp, record_path(profile))
+  except Exception as exc:
+    try:
+      os.unlink(tmp)
+    except OSError:
+      pass
+    print(f"omarchy-agent-usage-{profile.agent_id}: cannot write {record_path(profile)}: {exc}", file=sys.stderr)
+    raise
+
+
+def tier_label(profile: Profile, limits: list[dict[str, Any]], accounts: int, has_local_stats: bool) -> str:
+  """The line under the record's name: where its numbers come from.
+
+  Oh My Pi is a harness, not a plan: its line is the set of upstreams whose
+  limits the rows belong to. A single-provider record names no plan either —
+  omp does not report one — but says how many accounts the limit rows cover
+  and that its history is those accounts combined.
+  """
+  if not profile.provider:
+    providers = []
+    for row in limits:
+      name = str(row.get("label") or "").split(" · ", 1)[0]
+      if name and name not in providers:
+        providers.append(name)
+    return " · ".join(providers)
+  parts = ["Oh My Pi"]
+  if accounts > 0:
+    parts.append(f"{accounts} account" + ("" if accounts == 1 else "s"))
+  if has_local_stats:
+    parts.append("history of all accounts combined")
+  return " · ".join(parts)
+
+
+def build_record(
+  profile: Profile,
+  limits: list[dict[str, Any]],
+  accounts: int,
+  stats: dict[str, Any],
+  stats_problem: str,
+  limits_help: str,
+  retry_advised: bool,
+) -> dict[str, Any]:
+  has_local_stats = stats_problem == ""
+  record: dict[str, Any] = {
+    "schemaVersion": 1,
+    "id": profile.agent_id,
+    "name": profile.name,
+    "statsSource": f"omp:{profile.provider}" if profile.provider else "omp",
+    "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+    "ready": bool(limits) or whole(stats.get("totalSessions")) > 0 or whole(stats.get("totalPrompts")) > 0,
+    "hasLocalStats": has_local_stats,
+    "tierLabel": tier_label(profile, limits, accounts, has_local_stats),
+    "usageStatusText": "" if has_local_stats else stats_problem,
+    "authHelpText": limits_help,
+    "limits": limits,
+  }
+  if retry_advised:
+    record["retryAdvised"] = True
+  for key in STATS_KEYS:
+    record[key] = stats.get(key, empty_stats()[key])
+  return record
+
+
+def main(profile: Profile = OMP) -> int:
+  command = f"omarchy-agent-usage-{profile.agent_id}"
+  parser = argparse.ArgumentParser(
+    prog=command,
+    description=f"Print the {profile.name} usage record, from Oh My Pi (\u03c0/omp), as JSON.",
+    epilog="Exit codes: 0 record produced, 2 omp not installed, 3 neither limits nor local "
+           "stats were usable, 4 the record could not be written.",
+  )
+  parser.add_argument("--force", action="store_true", help="re-probe limits, ignoring the recent-limits cache")
+  parser.add_argument("--limits-only", action="store_true",
+                      help="refresh limits only; carry the previous record's local stats forward")
+  parser.add_argument("--write", action="store_true",
+                      help=f"write the record to {usage_dir()} instead of printing it")
+  parser.add_argument("--cache-seconds", type=float, default=PROBE_MIN_INTERVAL_SECONDS,
+                      help="how long a limits probe is reused for (default %(default)s)")
+  args = parser.parse_args()
+
+  omp = find_omp()
+  if omp is None:
+    print(f"{command}: omp not found on PATH", file=sys.stderr)
+    if args.write:
+      remove_record(profile)
+    return EXIT_OMP_MISSING
+
+  previous = read_json(record_path(profile)) if args.limits_only else None
+  limits, accounts, limits_help, retry_advised = collect_limits(omp, args.force, args.cache_seconds, profile)
+
+  if args.limits_only:
+    stats = read_fresh_stats(previous, profile)
+    if stats is None:
+      stats = empty_stats()
+      stats_problem = carried_stats_text(previous, profile)
+    else:
+      stats_problem = ""
+  else:
+    stats, stats_problem = collect_stats(omp, profile.provider)
+
+  if not limits and stats_problem != "":
+    if args.write and not written_by(read_json(record_path(profile)), profile):
+      remove_record(profile)
+    print(f"{command}: no usable source (limits and local stats both unavailable)", file=sys.stderr)
+    return EXIT_NO_SOURCES
+
+  record = build_record(profile, limits, accounts, stats, stats_problem, limits_help, retry_advised)
+  if args.write:
+    try:
+      write_record(record, profile)
+    except Exception:
+      return EXIT_WRITE_FAILED
+  else:
+    print(json.dumps(record, separators=(",", ":"), sort_keys=True))
+  return EXIT_OK
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())

@@ -1,0 +1,28 @@
+#!/usr/bin/python3
+# omarchy:summary=Print the Claude usage record, read from Oh My Pi (omp), as JSON
+# omarchy:args=[--force] [--limits-only] [--write]
+# omarchy:hidden=true
+"""The Claude record, from Oh My Pi rather than Claude Code.
+
+This is the omp collector (omarchy-agent-usage-omp, beside this file) run with
+its CLAUDE profile: omp's Anthropic limits, one row per account and window, and
+the Anthropic rows of omp's stats.db, which are every Claude account combined.
+It owns the `claude` record id — bin/agents-update keeps the packaged Claude
+Code collector from writing the same record.
+"""
+
+import importlib.machinery
+import importlib.util
+import sys
+from pathlib import Path
+
+# The collector is a script without a .py suffix; load it without dropping a
+# __pycache__ into the plugin's bin/.
+sys.dont_write_bytecode = True
+source = Path(__file__).resolve().with_name("omarchy-agent-usage-omp")
+loader = importlib.machinery.SourceFileLoader("omarchy_agent_usage_omp", str(source))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+collector = importlib.util.module_from_spec(spec)
+loader.exec_module(collector)
+
+raise SystemExit(collector.main(collector.CLAUDE))

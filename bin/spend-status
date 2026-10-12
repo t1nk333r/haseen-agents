@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+set -eo pipefail
+
+# Export environment paths so mise/nvm/bun/user tools are resolved when executed by Quickshell
+# ~/.local/share/npm/bin is where this host's codeburn actually lives (the
+# same prefix ~/.npm-global used to be); both stay on the list so the helper
+# works whichever prefix the npm global install is using.
+export PATH="$HOME/.local/share/npm/bin:$HOME/.npm-global/bin:$HOME/.local/share/mise/shims:$HOME/.local/bin:$PATH:/usr/local/bin:/usr/bin"
+
+PERIOD="${1:-today}"
+
+# Whitelist allowed period values to ensure safe argument passing
+case "$PERIOD" in
+  today|week|30days|month|all|lifetime) ;;
+  *) PERIOD="today" ;;
+esac
+
+# OMP is left OUT of the totals unless the caller passes --include-omp. That
+# default is this wrapper's contract with its other callers: the onefile spend
+# producer (ai-spend-produce.py) runs it with just a period and refuses a result
+# that still counts OMP. The Spend tab passes --include-omp unless its
+# spendExcludeOmp setting is on.
+INCLUDE_OMP=0
+if [ "${2:-}" = "--include-omp" ]; then INCLUDE_OMP=1; fi
+
+# No --scope combined: the payload's `current` block is this device's usage
+# either way (the combined block was never read by the panel), and combined
+# scope forbids --provider, which the OMP pre-read below needs.
+ARGS=(status --format menubar-json --period "$PERIOD" --no-optimize --no-timeline)
+CODEBURN_PACKAGE="codeburn@0.9.24"
+
+# CODEBURN_BIN pins the runner by path. The PATH export above deliberately puts
+# the real prefixes first, so PATH is not a way to point this at a stub; a test
+# (tests/spend/auto-price.test.sh) drives it through here instead.
+if [ -n "${CODEBURN_BIN:-}" ]; then
+  RUNNER=("$CODEBURN_BIN")
+elif command -v codeburn >/dev/null 2>&1; then
+  RUNNER=(codeburn)
+elif command -v npx >/dev/null 2>&1; then
+  RUNNER=(npx --yes "$CODEBURN_PACKAGE")
+elif command -v bunx >/dev/null 2>&1; then
+  RUNNER=(bunx "$CODEBURN_PACKAGE")
+else
+  echo '{"error":"neither codeburn nor npx found in PATH"}' >&2
+  exit 1
+fi
+
+# Keep a stable pointer at whatever codeburn currently is. Other callers name
+# it by path — the share unit in ~/.config/systemd/user is one — so when the
+# npm global prefix moves (it went from ~/.npm-global to ~/.local/share/npm)
+# those callers break until someone edits them. This makes the pointer follow,
+# and the share unit's own Restart=on-failure picks the new target up on its
+# next attempt. Only a real codeburn is pointed at, never the npx fallback, and
+# CODEBURN_STABLE_LINK moves the pointer so a test cannot repoint the real one.
+STABLE_LINK="${CODEBURN_STABLE_LINK:-$HOME/.local/bin/codeburn}"
+if command -v codeburn >/dev/null 2>&1; then
+  real_codeburn="$(command -v codeburn)"
+  if [ "$(readlink -f "$STABLE_LINK" 2>/dev/null)" != "$(readlink -f "$real_codeburn" 2>/dev/null)" ]; then
+    mkdir -p "$(dirname "$STABLE_LINK")" && ln -sfn "$real_codeburn" "$STABLE_LINK"
+  fi
+fi
+
+# By default the Spend figure does not use OMP's data: oh-my-pi is a subscription
+# harness whose API-rate cost is not money out of pocket, and it dominated every
+# total. The Spend tab asks for it back with --include-omp (an overview of what
+# the usage would have cost at API rates); everything else keeps the exclusion.
+# CodeBurn cannot exclude a provider from the status payload, so the OMP share
+# is read on its own FIRST -- before the main read, so it can never be larger
+# than what the main read contains -- and spend-status-enrich.py subtracts it.
+# A missing sessions directory (or CODEBURN_OMP_SESSIONS_DIR elsewhere) skips
+# the read: no OMP on disk, nothing to exclude.
+OMP_DIR="${CODEBURN_OMP_SESSIONS_DIR:-$HOME/.omp/agent/sessions}"
+if [ "$INCLUDE_OMP" = 0 ] && [ -d "$OMP_DIR" ]; then
+  OMP_FILE="$(mktemp)"
+  trap 'rm -f "${OMP_FILE:-}"' EXIT
+  if "${RUNNER[@]}" status --format menubar-json --period "$PERIOD" \
+      --provider omp --no-optimize --no-timeline > "$OMP_FILE" 2>/dev/null; then
+    export CODEBURN_OMP_STATUS_FILE="$OMP_FILE"
+  else
+    rm -f "$OMP_FILE"
+    unset OMP_FILE
+  fi
+fi
+
+STATUS="$("${RUNNER[@]}" "${ARGS[@]}")"
+
+# Fold per-model token usage and the local-currency rate into the status the
+# panel reads (status-enrich.py explains what each one is), and price whatever
+# CodeBurn reported usage for but had no rate for. The panel is usable without
+# any of it, so anything going wrong here passes the status through as it came
+# rather than blanking the popup.
+ENRICH="$(dirname "$(readlink -f "$0")")/spend-status-enrich.py"
+export CODEBURN_RUNNER="${RUNNER[*]}"
+enrich() {
+  if [ -x "$ENRICH" ] && command -v python3 >/dev/null 2>&1; then
+    printf '%s' "$1" | python3 "$ENRICH" "$PERIOD" || printf '%s' "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+OUT="$(enrich "$STATUS")"
+
+# If the enrich step had to price something, the status in hand is the unpriced
+# one it was computed from. Read once more, so the poll that noticed the gap is
+# also the poll that shows the money it filled in — one retry, never a loop. The
+# record of what was priced travels with the second read, so the panel still
+# learns what happened.
+carried="$(printf '%s' "$OUT" | python3 -c 'import json,sys
+try: print(json.dumps(json.load(sys.stdin).get("autoPriced") or []))
+except Exception: print("[]")' 2>/dev/null || printf '[]')"
+if [ -n "$carried" ] && [ "$carried" != "[]" ]; then
+  STATUS="$("${RUNNER[@]}" "${ARGS[@]}")"
+  export CODEBURN_AUTO_PRICED="$carried"
+  OUT="$(enrich "$STATUS")"
+fi
+
+printf '%s' "$OUT"

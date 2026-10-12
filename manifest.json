@@ -1,90 +1,50 @@
 {
   "schemaVersion": 1,
   "id": "t1nk33r.agents",
-  "name": "My Agents",
-  "version": "2.1.0",
+  "name": "My AI",
+  "version": "3.0.0",
   "author": "t1nk33r",
   "license": "MIT",
-  "description": "Claude, Codex and Fireworks usage, limits and pace in one native Omarchy bar panel. Merges the former t1nk33r.agent-usage plugin (plan 090); spend lives in t1nk33r.codeburn.",
-  "kinds": [
-    "bar-widget"
-  ],
+  "description": "Every AI surface in one bar mark and one tabbed panel: subscription limits and pace (Claude, Codex, Fireworks, OMP), spend analytics (codeburn), the Herdr/OMP connector fleet, the DeepSeek balance with its peak/off-peak schedule, and the OpenRouter credit balance and spend. Merges t1nk33r.codeburn, t1nk33r.fleet-shepherd and t1nk33r.deepseek (plan 128) into the former t1nk33r.agents (plan 090).",
+  "kinds": ["bar-widget"],
   "activation": "on-demand",
-  "entryPoints": {
-    "barWidget": "Panel.qml"
-  },
+  "entryPoints": { "barWidget": "Panel.qml" },
   "barWidget": {
-    "displayName": "My Agents",
-    "description": "One bar icon and one panel: rate-limit meters with pace, today, the last week, and the all-time model breakdown for every subscription.",
+    "displayName": "AI",
+    "description": "One glyph, one badge, five tabs: Limits · Spend · Fleet · DeepSeek · OpenRouter.",
     "category": "AI",
-    "aliases": [
-      "agents",
-      "model-usage"
-    ],
+    "aliases": ["agents", "ai", "model-usage", "burn", "ai-cost", "fleet", "fleet-shepherd", "deepseek", "openrouter"],
     "allowMultiple": false,
     "defaults": {
-      "providers": {
-        "claude": {
-          "enabled": true
-        },
-        "codex": {
-          "enabled": true
-        },
-        "fireworks": {
-          "enabled": true
-        }
-      },
+      "providers": { "claude": { "enabled": true }, "codex": { "enabled": true }, "fireworks": { "enabled": true } },
       "refreshIntervalSec": 300,
-      "syncMode": "Off",
-      "syncDir": "",
-      "syncFileName": "",
-      "syncDeviceId": ""
+      "syncMode": "Off", "syncDir": "", "syncFileName": "", "syncDeviceId": "",
+      "spendRefreshIntervalSec": 300, "spendExcludeOmp": false,
+      "fleetRefreshIntervalSec": 30, "fleetCacheTtl": 120, "fleetMaxAgentRows": 3,
+      "deepseekTokenModel": "deepseek-flash",
+      "openrouterRefreshIntervalSec": 300, "openrouterLowBalance": 5,
+      "barBadge": "fleet",
+      "defaultTab": "limits",
+      "defaultProvider": "omp"
     },
     "schema": [
-      {
-        "key": "refreshIntervalSec",
-        "type": "integer",
-        "label": "Refresh interval (seconds)",
-        "min": 30,
-        "max": 3600,
-        "step": 30,
-        "defaultValue": 900
-      },
-      {
-        "key": "syncMode",
-        "type": "enum",
-        "label": "Synced aggregation",
-        "options": [
-          "Off",
-          "On"
-        ],
-        "defaultValue": "Off",
-        "description": "When On, write this machine's local usage snapshot and merge snapshots from other machines."
-      },
-      {
-        "key": "syncDir",
-        "type": "path",
-        "label": "Sync folder",
-        "defaultValue": "",
-        "description": "A folder synced by Syncthing, Dropbox, rsync, etc."
-      },
-      {
-        "key": "syncFileName",
-        "type": "string",
-        "label": "Snapshot file name",
-        "defaultValue": "",
-        "description": "Optional. Defaults to <hostname>.json. Use a different file name on each machine, such as laptop.json or desktop.json."
-      },
-      {
-        "key": "syncDeviceId",
-        "type": "string",
-        "label": "Device id",
-        "defaultValue": "",
-        "description": "Optional stable device name used inside synced aggregate snapshots."
-      }
+      { "key": "barBadge", "type": "enum", "label": "Bar badge", "options": ["fleet", "deepseek", "openrouter", "spend", "none"], "defaultValue": "fleet", "description": "The figure shown beside the glyph: fleet working count, DeepSeek balance, OpenRouter balance, current-period spend, or nothing." },
+      { "key": "defaultTab", "type": "enum", "label": "Tab on open", "options": ["limits", "spend", "fleet", "deepseek", "openrouter"], "defaultValue": "limits", "description": "The tab every opening of the panel lands on. IPC `tab`/`next` and a middle-click on the mark still open on the tab they ask for." },
+      { "key": "defaultProvider", "type": "enum", "label": "Limits provider on open", "options": ["omp", "claude", "codex", "fireworks"], "defaultValue": "omp", "description": "The Limits rail provider every opening selects. If it has no record yet, the first provider shows until it arrives; a provider picked while the panel is open stays picked." },
+      { "key": "refreshIntervalSec", "type": "integer", "label": "Limits refresh (seconds)", "min": 30, "max": 3600, "step": 30, "defaultValue": 300 },
+      { "key": "syncMode", "type": "enum", "label": "Synced aggregation", "options": ["Off", "On"], "defaultValue": "Off", "description": "When On, write this machine's local usage snapshot and merge snapshots from other machines." },
+      { "key": "syncDir", "type": "path", "label": "Sync folder", "defaultValue": "" },
+      { "key": "syncFileName", "type": "string", "label": "Snapshot file name", "defaultValue": "" },
+      { "key": "syncDeviceId", "type": "string", "label": "Device id", "defaultValue": "" },
+      { "key": "spendRefreshIntervalSec", "type": "integer", "label": "Spend refresh (seconds)", "min": 60, "max": 3600, "step": 30, "defaultValue": 300 },
+      { "key": "spendExcludeOmp", "type": "boolean", "label": "Spend: leave OMP out", "defaultValue": false, "description": "The Spend tab counts oh-my-pi's usage at API rates, an overview of what it would have cost. Turn on to take OMP off the totals, tokens, activities and providers instead." },
+      { "key": "fleetRefreshIntervalSec", "type": "integer", "label": "Fleet refresh (seconds)", "min": 5, "max": 3600, "step": 5, "defaultValue": 30 },
+      { "key": "fleetCacheTtl", "type": "integer", "label": "Fleet snapshot cache lifetime (seconds)", "min": 1, "max": 300, "step": 5, "defaultValue": 120 },
+      { "key": "fleetMaxAgentRows", "type": "integer", "label": "Agent rows per connector", "min": 1, "max": 12, "step": 1, "defaultValue": 3 },
+      { "key": "deepseekTokenModel", "type": "select", "label": "DeepSeek model for the token estimate", "defaultValue": "deepseek-flash", "options": [ { "label": "deepseek-flash", "value": "deepseek-flash" }, { "label": "deepseek-v4-pro", "value": "deepseek-v4-pro" } ] },
+      { "key": "openrouterRefreshIntervalSec", "type": "integer", "label": "OpenRouter refresh (seconds)", "min": 60, "max": 21600, "step": 30, "defaultValue": 300 },
+      { "key": "openrouterLowBalance", "type": "number", "label": "OpenRouter low balance (credits)", "min": 0, "max": 100000, "step": 1, "defaultValue": 5, "description": "The mark turns urgent when the OpenRouter balance is at or below this many credits (US dollars)." }
     ]
   },
-  "omarchy": {
-    "clonedFrom": "omarchy.agents"
-  }
+  "omarchy": { "clonedFrom": "omarchy.agents" }
 }

@@ -1,0 +1,110 @@
+#!/bin/bash
+# omarchy:summary=Refresh the AI agent usage records (packaged collectors plus this plugin's own)
+# omarchy:args=[--force] [--limits-only] [--except <agent>] [agent...]
+# omarchy:hidden=true
+
+# omarchy-agent-usage-update discovers collectors only in $OMARCHY_PATH/bin,
+# which is pacman-owned and must not be written to — so a collector that ships
+# with this plugin cannot be discovered by it. This wrapper is what the panel
+# invokes instead: it forwards the caller's argv to the packaged updater and
+# then runs this plugin's own collectors (`bin/omarchy-agent-usage-<agent>`)
+# with the same flags, so a refresh means the same thing it always did.
+#
+# A plugin collector prints one record; --write makes it land in the usage
+# directory itself, atomically. Exit code 2 means "my CLI is not installed":
+# nothing was written, nothing needs saying, and the wrapper stays quiet.
+#
+# A plugin collector owns its record id. The packaged updater is told to skip
+# every id a plugin collector writes (`--except <agent>`, ahead of the caller's
+# own argv), so the packaged Claude Code collector never reads Claude Code's
+# login or overwrites the Claude record this plugin collects from Oh My Pi —
+# whether the run is a full, forced, limits-only or single-agent one.
+#
+# Records land in ${XDG_STATE_HOME:-~/.local/state}/haseen/agents/usage. The
+# packaged updater only writes $XDG_STATE_HOME/omarchy/agents/usage and has no
+# option to change that, so it runs with XDG_STATE_HOME pointed at a private
+# scratch directory beside the usage directory, and the records it writes are
+# renamed into place from there (the packaged collectors read no state of their
+# own under XDG_STATE_HOME; their caches follow XDG_CACHE_HOME, untouched).
+
+self_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+packaged="${OMARCHY_PATH:-/usr/share/omarchy}/bin/omarchy-agent-usage-update"
+usage_dir="${XDG_STATE_HOME:-$HOME/.local/state}/haseen/agents/usage"
+
+"$self_dir/agents-migrate"
+
+original=("$@")
+
+# Split the argv the way the packaged updater does: flags pass through to every
+# collector, --except <agent> names an agent to skip, and a bare word limits the
+# run to that agent.
+flags=()
+only=()
+excluded=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+  --force | --limits-only) flags+=("$1") ;;
+  --except)
+    excluded+=("${2:-}")
+    shift
+    ;;
+  *) only+=("$1") ;;
+  esac
+  shift
+done
+
+wanted() {
+  local agent="$1" candidate
+  for candidate in "${excluded[@]}"; do
+    [[ $candidate == "$agent" ]] && return 1
+  done
+  (( ${#only[@]} == 0 )) && return 0
+  for candidate in "${only[@]}"; do
+    [[ $candidate == "$agent" ]] && return 0
+  done
+  return 1
+}
+
+owned=()
+for collector in "$self_dir"/omarchy-agent-usage-*; do
+  [[ -x $collector ]] && owned+=(--except "${collector##*/omarchy-agent-usage-}")
+done
+
+status=0
+
+if [[ ! -x $packaged ]]; then
+  echo "agents-update: $packaged is missing; running this plugin's collectors only" >&2
+elif ! mkdir -p -- "$usage_dir" || ! scratch=$(mktemp -d "${usage_dir%/*}/.packaged.XXXXXX"); then
+  echo "agents-update: cannot prepare $usage_dir; the packaged collectors were skipped" >&2
+  status=1
+else
+  XDG_STATE_HOME="$scratch" "$packaged" "${owned[@]}" "${original[@]}" || status=1
+  for record in "$scratch"/omarchy/agents/usage/*.json; do
+    [[ -f $record ]] && mv -f -- "$record" "$usage_dir/"
+  done
+  rm -rf -- "$scratch"
+fi
+
+# The exit status stays the packaged updater's: it is what everything around
+# this plugin already understands, and a plugin collector that cannot reach its
+# CLI must not turn a healthy refresh into a failed one. A collector that does
+# fail says so on stderr, which the widget logs.
+for collector in "$self_dir"/omarchy-agent-usage-*; do
+  [[ -x $collector ]] || continue
+  agent="${collector##*/omarchy-agent-usage-}"
+  wanted "$agent" || continue
+
+  message=$("$collector" "${flags[@]}" --write 2>&1)
+  collector_status=$?
+  if (( collector_status == 2 )); then
+    # The agent's CLI is not installed. The collector has already dropped any
+    # record an earlier install left behind, and a machine that never had the
+    # CLI must behave exactly as it did before: say nothing.
+    continue
+  elif (( collector_status != 0 )); then
+    [[ -n $message ]] && printf '%s\n' "$message" >&2
+    echo "omarchy-agent-usage-update: $agent collector failed" >&2
+  fi
+done
+
+exit $status

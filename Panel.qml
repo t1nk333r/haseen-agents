@@ -5,358 +5,248 @@ import Quickshell.Io
 import qs.Commons
 import qs.Ui
 
+// Every AI surface in one bar mark and one tabbed panel (plan 128).
+//
+//   Limits    subscription limits and pace — Claude, Codex, Fireworks, OMP
+//             (UsageService.qml + LimitsTab.qml, formerly t1nk33r.agents)
+//   Spend     spend and token analytics from the `codeburn` npm tool
+//             (SpendService.qml + SpendTab.qml, formerly t1nk33r.codeburn)
+//   Fleet     read-only Herdr/OMP connector fleet state
+//             (FleetService.qml + FleetTab.qml, formerly t1nk33r.fleet-shepherd)
+//   DeepSeek  balance, availability, usage ledger and peak/off-peak pricing
+//             (DeepSeekService.qml + DeepSeekTab.qml, formerly t1nk33r.deepseek)
+//   OpenRouter  remaining credit, the key's spend cap and spend windows
+//             (OpenRouterService.qml + OpenRouterTab.qml, bin/openrouter-*)
+//
+// Each tab is two columns — a bounded left rail (which one, and its totals) and
+// a scrolling right pane (the data) — as approved from the plan-128 mockup.
+// Keys: j/k move the rail's chips, Ctrl+j/Ctrl+k (or h/l, PgUp/PgDn) move the
+// pane, 1-5 / [ ] switch tabs, r refreshes the active tab, Esc closes.
+//
+// The five data halves are hidden Items instantiated once, each with its own
+// poll loop, so a slow `npx codeburn` run cannot stall the other tabs. Every
+// collector, model and external config path is the one its parent plugin used;
+// what is new here is the mark, the shared hero, the tab strip and this
+// coordinator.
+//
+// This file is the plugin's only entry point (manifest entryPoints.barWidget)
+// and the manifest kinds are ["bar-widget"] alone, so there is no BarWidget.qml
+// wrapper and no Loader: the panel IS the bar widget. Per-widget settings
+// arrive inline on the widget's shell.json entry and are read through
+// Panel.setting(); their names and defaults are declared in manifest.json
+// under barWidget.defaults/barWidget.schema.
 Panel {
   id: root
-  // The fork carried the built-in's id: settings are injected by manifest id
-  // (t1nk33r.agents) but any write-back keys off moduleName, so persisting a
-  // setting would have landed on omarchy.agents' entry instead of this one.
+  // The agents fork carried the built-in's id; keep it, so a setting
+  // written back lands on this plugin's own shell.json entry.
   moduleName: "t1nk33r.agents"
   ipcTarget: "t1nk33r.agents"
+  // manageIpc: false so this panel owns the single IpcHandler the target
+  // permits — needed for the tab/refresh/setPeriod methods below.
   manageIpc: false
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
+  readonly property color accent: Color.accent
   readonly property color dim: Qt.darker(foreground, 1.55)
-  readonly property color surface: Color.popups.background
-  readonly property color track: Style.selectedFillFor(foreground, Color.accent)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
-  readonly property var providers: usage.enabledProviders
-  // The selection follows the provider, not the slot it happens to sit in: a
-  // provider whose first scan lands while the panel is open would otherwise
-  // shift the list underneath you and swap out what you were reading.
-  property string selectedProviderId: ""
-  readonly property int providerIndex: {
-    for (var i = 0; i < providers.length; i++)
-      if (providers[i].providerId === selectedProviderId) return i
-    return 0
+  // ------------------------------------------------------------------- tabs
+  //
+  // Every normal opening lands on the defaultTab setting (and, on Limits, the
+  // defaultProvider setting); clicks and keystrokes move `tab` only while the
+  // panel is open. An explicit request — IPC `tab`, IPC `next`, a middle-click
+  // — parks its tab in `requestedTab`, and the opening that follows lands
+  // there instead of on the default.
+  readonly property var tabs: [
+    { value: "limits", label: "1 Limits" },
+    { value: "spend", label: "2 Spend" },
+    { value: "fleet", label: "3 Fleet" },
+    { value: "deepseek", label: "4 DeepSeek" },
+    { value: "openrouter", label: "5 OpenRouter" }
+  ]
+  readonly property string defaultTab: root.tabIndex(String(setting("defaultTab", "limits"))) >= 0
+    ? String(setting("defaultTab", "limits")) : "limits"
+  readonly property string defaultProvider: String(setting("defaultProvider", "omp"))
+  property string tab: root.defaultTab
+  property string requestedTab: ""
+  readonly property var active: root.tab === "limits" ? limitsTab
+    : (root.tab === "spend" ? spendTab
+      : (root.tab === "fleet" ? fleetTab
+        : (root.tab === "openrouter" ? openrouterTab : deepseekTab)))
+
+  // The key catcher owns the keys on every tab, the OpenRouter tab included:
+  // its key field takes focus only on an explicit action (Enter, a click, the
+  // Replace/Enter-key buttons), never just by being landed on, so a no-key
+  // form can never trap the tab keys. A tab change hands the keys back.
+  function focusCatcher() {
+    if (root.opened) keyCatcher.forceActiveFocus()
   }
-  readonly property var provider: providers.length > 0 ? providers[providerIndex] : null
 
-  property bool cursorActive: false
+  onTabChanged: if (root.opened) Qt.callLater(root.focusCatcher)
 
-  // Countdowns and "updated" read this instead of Date.now() so the
+  // Countdowns and "updated" ages read this instead of Date.now() so the
   // panel keeps telling the truth while it sits open.
   property double nowMs: Date.now()
 
-  readonly property var limits: limitWindows(provider)
-  readonly property var models: modelRows(provider)
-  readonly property var headline: bindingWindow(provider)
-  readonly property var balance: provider ? (provider.balance || null) : null
-  // A prepaid account runs low the way a subscription window fills up: the
-  // last 10% of the funded credits lights the same alarm.
-  readonly property bool balanceAlarming: !!balance && balance.funded > 0
-    && balance.remaining / balance.funded <= 0.1
-  readonly property bool alarming: (!!headline && headline.percent >= 0.9) || balanceAlarming
-
-  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)) }
-  function alpha(c, a) { return Qt.rgba(c.r, c.g, c.b, a) }
-
-  function selectProvider(index) {
-    if (providers.length === 0) return
-    var wrapped = ((index % providers.length) + providers.length) % providers.length
-    selectedProviderId = providers[wrapped].providerId
+  function tabIndex(name) {
+    for (var i = 0; i < root.tabs.length; i++) if (root.tabs[i].value === name) return i
+    return -1
   }
 
-  function refreshNow() {
-    usage.refreshAll(true)
+  function setTab(name) {
+    var wanted = String(name || "")
+    if (root.tabIndex(wanted) < 0) return false
+    root.tab = wanted
+    return true
   }
 
-  function launchAgent() {
-    if (root.bar) root.bar.run("omarchy-agent --pick")
-    root.close()
+  // The tab `delta` steps from `from`, wrapping.
+  function tabAfter(from, delta) {
+    var index = Math.max(0, root.tabIndex(from))
+    var next = ((index + delta) % root.tabs.length + root.tabs.length) % root.tabs.length
+    return root.tabs[next].value
   }
 
-  // ---------------------------------------------------------------- limits
-  //
-  // Both providers report the same two shapes: a short rolling session window
-  // and a long weekly one. Everything below normalizes them into one record so
-  // the meters and the hero speak a single language.
-
-  // Claude spells its windows out ("Session (5-hour)"), Codex abbreviates
-  // them ("5h window", "30m window"). Both have to land on the same record.
-  function windowIsLong(text) {
-    return text.indexOf("week") >= 0 || text.indexOf("7-day") >= 0 || text.indexOf("seven") >= 0
-      || text.indexOf("month") >= 0 || text.indexOf("30-day") >= 0
+  // Open: step from the tab on screen. Closed: step from the tab the next
+  // opening would land on, and park the result for that opening.
+  function cycleTab(delta) {
+    if (root.opened) root.tab = root.tabAfter(root.tab, delta)
+    else root.requestedTab = root.tabAfter(root.requestedTab !== "" ? root.requestedTab : root.defaultTab, delta)
   }
 
-  function windowSpanMs(label) {
-    var text = String(label || "").toLowerCase()
-    if (text.indexOf("month") >= 0 || text.indexOf("30-day") >= 0) return 30 * 24 * 3600 * 1000
-    if (windowIsLong(text)) return 7 * 24 * 3600 * 1000
-    var hours = text.match(/(\d+)\s*-?\s*h(?:our)?\b/)
-    if (hours) return Number(hours[1]) * 3600 * 1000
-    var minutes = text.match(/(\d+)\s*-?\s*m(?:in(?:ute)?s?)?\b/)
-    if (minutes) return Number(minutes[1]) * 60 * 1000
-    return 0
-  }
-
-  // Pace, ported from t1nk33r.agent-usage when the three agent-telemetry
-  // plugins merged (plan 090). It was the one signal that plugin had and this
-  // one did not: a percentage says how much of the allowance is gone, pace says
-  // whether it is going faster than the window can refill. Burning 60% of a
-  // weekly limit is fine on day five and a problem on day two.
-  //
-  // agent-usage compared `weekly.remaining` against the fraction of the window
-  // still to run. The same comparison here uses windowSpanMs() for the window
-  // length, so it works for any labelled window rather than only the weekly one.
-  function paceDelta(window) {
-    if (!window) return 0
-    // windowSpanMs only reads a duration out of labels that carry digits
-    // ("5h window", "30m window"). The weekly and monthly windows are spelled
-    // in words ("Weekly", "Fable Weekly"), so it returned 0 for exactly the
-    // windows pace matters most for. Fall back to the shape windowIsLong
-    // already recognises.
-    var label = String(window.label || "").toLowerCase()
-    var span = windowSpanMs(window.label)
-    if (span <= 0 && windowIsLong(label))
-      span = (label.indexOf("month") >= 0 || label.indexOf("30-day") >= 0)
-        ? 30 * 24 * 3600 * 1000
-        : 7 * 24 * 3600 * 1000
-    var remainingMs = resetMsFor(window)
-    if (span <= 0 || remainingMs <= 0) return 0
-    var expectedRemaining = clamp(remainingMs / span, 0, 1)
-    var actualRemaining = clamp(1 - window.percent, 0, 1)
-    return actualRemaining - expectedRemaining
-  }
-
-  // A small tolerance, so a window sitting exactly on pace does not flicker
-  // between "ahead" and "behind" as the countdown ticks.
-  function behindPace(window) { return paceDelta(window) < -0.0005 }
-
-  function windowTitle(label) {
-    var text = String(label || "").toLowerCase()
-    if (text.indexOf("month") >= 0) return "Monthly"
-    if (windowIsLong(text)) return "Weekly"
-    if (text.indexOf("session") >= 0 || windowSpanMs(label) > 0) return "Session"
-    var plain = String(label || "").replace(/\s*\(.*\)\s*/, "").trim()
-    return plain === "" ? "Limit" : plain
-  }
-
-  // A collector that already knows which window a limit belongs to says so,
-  // and that beats reading it back out of the label: a model-scoped limit is
-  // titled after its model, and a name like "Opus 5 (1M context)" would parse
-  // as a one-minute window.
-  function limitWindow(label, percent, resetAt, title) {
-    return {
-      title: String(title || "") !== "" ? String(title) : windowTitle(label),
-      percent: Number(percent),
-      resetAt: String(resetAt || ""),
-      // The raw label is kept, not just the display title: paceDelta needs the
-      // window's length, and only the label carries it ("Session (5-hour)",
-      // "Weekly (7-day)"). windowTitle() flattens both to a word.
-      label: String(label || "")
+  // Open on a named tab; false (and nothing opens) for an unknown name.
+  function openOnTab(name) {
+    var wanted = String(name || "")
+    if (root.tabIndex(wanted) < 0) return false
+    if (root.opened) root.tab = wanted
+    else {
+      root.requestedTab = wanted
+      root.open()
     }
+    return true
   }
 
-  function limitWindows(p) {
-    if (!p) return []
-    var out = []
-    var list = p.limits || []
-    for (var i = 0; i < list.length; i++) {
-      var entry = list[i] || {}
-      var percent = Number(entry.percent)
-      if (percent >= 0) out.push(limitWindow(entry.label, percent, entry.resetsAt, entry.title))
-    }
-    return out
-  }
-
-  // The window that decides how much room is left — the fullest one, since
-  // that is what stops the next prompt.
-  function bindingWindow(p) {
-    var windows = limitWindows(p)
-    var best = null
-    for (var i = 0; i < windows.length; i++) {
-      if (!best || windows[i].percent > best.percent) best = windows[i]
-    }
-    return best
-  }
-
-  function resetMsFor(w) {
-    if (!w || w.resetAt === "") return -1
-    var ms = new Date(w.resetAt).getTime()
-    return isFinite(ms) ? ms - root.nowMs : -1
-  }
-
-  function formatDuration(ms) {
-    if (!(ms > 0)) return "now"
-    var minutes = Math.floor(ms / 60000)
-    var hours = Math.floor(minutes / 60)
-    var days = Math.floor(hours / 24)
-    if (days > 0) return days + "d " + (hours % 24) + "h"
-    if (hours > 0) return hours + "h " + (minutes % 60) + "m"
-    return Math.max(1, minutes) + "m"
-  }
-
-  // ---------------------------------------------------------------- balance
-  //
-  // Prepaid agents report a credit ledger instead of rate-limit windows: the
-  // record's balance object carries remaining, funded, and spent amounts.
-
-  function currencyPrefix(currency) {
-    var code = String(currency || "USD").toUpperCase()
-    if (code === "USD") return "$"
-    if (code === "EUR") return "€"
-    if (code === "GBP") return "£"
-    return code + " "
-  }
-
-  function formatMoney(value, currency) {
-    var amount = Number(value)
-    if (!isFinite(amount)) amount = 0
-    return currencyPrefix(currency) + amount.toFixed(2)
-  }
-
-  function balanceDetailText(b) {
-    if (!b || !(b.funded > 0)) return ""
-    var text = formatMoney(b.spent, b.currency) + " spent of " + formatMoney(b.funded, b.currency) + " funded"
-    if (b.estimated) text += " · estimated"
-    return text
-  }
-
-  // ---------------------------------------------------------------- content
-
-  // The plan you pay for, under the name of the tool it pays for. Limits live
-  // in their own section; the hero just says what this is.
-  function heroMeta(p) {
-    if (!p) return ""
-    if (String(p.usageStatusText || "") !== "") return p.usageStatusText
-    var tier = String(p.tierLabel || "")
-    if (tier === "") return "Subscription"
-    return tier.charAt(0).toUpperCase() + tier.slice(1)
-  }
-
-  // Local calendar date, recomputed from nowMs so a panel left open across
-  // midnight moves the "Today" row with the clock.
-  function todayDate() {
-    var now = new Date(root.nowMs)
-    return now.getFullYear()
-      + "-" + String(now.getMonth() + 1).padStart(2, "0")
-      + "-" + String(now.getDate()).padStart(2, "0")
-  }
-
-  function dayName(date) {
-    var parsed = new Date(String(date || "") + "T00:00:00")
-    if (isNaN(parsed.getTime())) return String(date || "")
-    return ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][parsed.getDay()]
-  }
-
-  function dayLabel(date, today) {
-    if (today) return "Today"
-    return dayName(date)
-  }
-
-  function dayTooltip(day, today) {
-    if (!day) return ""
-    var parsed = new Date(String(day.date) + "T00:00:00")
-    var label = isNaN(parsed.getTime())
-      ? String(day.date)
-      : dayName(day.date) + " " + (parsed.getMonth() + 1) + "/" + parsed.getDate()
-    var text = label + " · " + usage.formatTokenCount(Number(day.messageCount || 0)) + " tokens"
-    // Prompt and session counts only exist for today, so they ride along here
-    // instead of taking a section of their own. Billing-API agents never
-    // count prompts, and "0 prompts" would read as a quiet day, not a gap.
-    if (today && provider && provider.hasPromptStats !== false)
-      text += " · " + Number(provider.todayPrompts || 0) + " prompts · "
-        + Number(provider.todaySessions || 0) + " sessions"
-    return text
-  }
-
-  function weekPeak(p) {
-    var days = p ? (p.recentDays || []) : []
-    var peak = 0
-    for (var i = 0; i < days.length; i++) peak = Math.max(peak, Number(days[i].messageCount || 0))
-    return peak
-  }
-
-  function modelRows(p) {
-    var usageByModel = p ? (p.modelUsage || {}) : {}
-    var rows = []
-    for (var id in usageByModel) {
-      var bucket = usageByModel[id] || {}
-      var input = Number(bucket.inputTokens || 0)
-      var output = Number(bucket.outputTokens || 0)
-      var cacheRead = Number(bucket.cacheReadInputTokens || 0)
-      var cacheWrite = Number(bucket.cacheCreationInputTokens || 0)
-      rows.push({
-        name: usage.friendlyModelName(id),
-        total: input + output + cacheRead + cacheWrite,
-        input: input,
-        output: output,
-        cacheRead: cacheRead,
-        cacheWrite: cacheWrite
-      })
-    }
-    rows.sort(function(a, b) { return b.total - a.total })
-    return rows.slice(0, 4)
-  }
-
-  function modelTooltip(row) {
-    if (!row) return ""
-    return "In " + usage.formatTokenCount(row.input)
-      + " · out " + usage.formatTokenCount(row.output)
-      + " · cache read " + usage.formatTokenCount(row.cacheRead)
-      + " · cache write " + usage.formatTokenCount(row.cacheWrite)
-  }
-
-  // Only speaks up when the numbers cover more than this machine.
-  function footerText() {
-    if (usage.syncStatusText !== "") return usage.syncStatusText
-    if (provider && provider.syncEnabled && provider.syncDeviceCount > 0)
-      return "Merged from " + provider.syncDeviceCount + " device" + (provider.syncDeviceCount === 1 ? "" : "s")
-    return ""
-  }
-
-  // Agents that ship a white mark carry an `assets/<id>-light.svg` twin for
-  // light surfaces; marks that work on both (Claude's brand-orange) ship one
-  // file. The luminance check decides which candidate to try first.
-  function colorChannelLuminance(value) {
-    var channel = Number(value)
-    if (!isFinite(channel)) return 0
-    return channel <= 0.03928 ? channel / 12.92 : Math.pow((channel + 0.055) / 1.055, 2.4)
-  }
-
-  function colorLuminance(color) {
-    return 0.2126 * colorChannelLuminance(color.r)
-      + 0.7152 * colorChannelLuminance(color.g)
-      + 0.0722 * colorChannelLuminance(color.b)
-  }
-
-  // Marks resolve by convention, so a new agent's data file needs nothing
-  // from this panel: assets/<id>.svg if it ships one, the module's bar glyph
-  // if it doesn't.
-  function iconCandidatesForProvider(p, surfaceColor) {
-    if (!p) return []
-    var candidates = []
-    if (colorLuminance(surfaceColor || Color.background) >= 0.5)
-      candidates.push(Qt.resolvedUrl("assets/" + p.providerId + "-light.svg"))
-    candidates.push(Qt.resolvedUrl("assets/" + p.providerId + ".svg"))
-    return candidates
-  }
-
-  // Nothing to report, nothing in the bar: Bar.qml collapses a slot whose item
-  // is invisible, so the icon appears the moment the first scan finds usage and
-  // stays away entirely on a machine that has never run either CLI.
-  visible: providers.length > 0
-  implicitWidth: button.implicitWidth
-  implicitHeight: button.implicitHeight
-
-  onProviderIndexChanged: if (panelFlick) panelFlick.contentY = 0
-  onOpenedChanged: if (opened) {
-    cursorActive = false
-    nowMs = Date.now()
-    if (panelFlick) panelFlick.contentY = 0
-    usage.refreshLimits()
-    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
-  }
-
-  Main {
+  // ---------------------------------------------------------------- services
+  UsageService {
     id: usage
     settings: root.settings
   }
 
-  // Cheap enough to keep running: it only re-evaluates text bindings, and a
-  // stale "resets in 2h" on a panel that is open is worse than a timer.
+  SpendService {
+    id: spend
+    settings: root.settings
+  }
+
+  FleetService {
+    id: fleet
+    settings: root.settings
+    // A successful raise focuses the connector's terminal, and this panel is a
+    // KeyboardPanel — an Overlay layer surface painted *above* every window,
+    // so leaving it up would hide the very window the raise just brought
+    // forward. The fleet-shepherd panel closed itself on the same signal;
+    // nothing else can do it, because only the service knows the focus helper
+    // exited 0.
+    onConnectorRaised: root.close()
+  }
+
+  DeepSeekService {
+    id: deepseek
+    settings: root.settings
+  }
+
+  OpenRouterService {
+    id: openrouter
+    settings: root.settings
+  }
+
+  // --------------------------------------------------------------- bar state
+  //
+  // A limit window past 90 %, a prepaid balance in its last 10 % (Limits), a
+  // blocked connector (Fleet), or a DeepSeek or OpenRouter balance that is low
+  // or failed all light the same mark. Spend never alarms: a bill is not an
+  // alarm.
+  readonly property bool alarming: limitsTab.alarming
+    || fleet.summary.blocked > 0
+    || deepseek.attention
+    || openrouter.attention
+
+  // The badge is a setting, not a policy: the owner's call for the bar is the
+  // fleet's working count, and the alternatives are a balance or the period's
+  // spend for anyone who would rather read the money.
+  readonly property string barBadge: String(setting("barBadge", "fleet"))
+  readonly property string badgeText: {
+    if (root.barBadge === "none") return ""
+    if (root.barBadge === "deepseek") return deepseek.labelText
+    if (root.barBadge === "openrouter") return openrouter.labelText
+    if (root.barBadge === "spend") return spend.isOnline ? spend.formatCost(spend.cost) : "—"
+    return fleet.barLabel
+  }
+
+  // Five lines, one per tab: the bar carries one number, the tooltip carries
+  // the whole panel.
+  readonly property string barTooltip: {
+    var lines = []
+    var window = limitsTab.headline
+    lines.push("Limits: " + (window
+      ? window.title + " " + Math.round(Number(window.percent) * 100) + "%"
+      : "no subscriptions"))
+    lines.push("Spend (" + spend.selectedPeriodLabel + "): "
+      + (spend.isOnline ? spend.formatCost(spend.cost) : "unavailable"))
+    lines.push("Fleet: " + fleet.summary.online + "/" + fleet.summary.connectors
+      + " online · " + fleet.summary.working + " working · " + fleet.summary.blocked + " blocked")
+    lines.push("DeepSeek: " + deepseek.labelText + " · " + (deepseek.peak ? "peak" : "off-peak")
+      + " · " + deepseek.pricingFlipLocal)
+    lines.push(openrouter.tooltipLine)
+    return lines.join("\n")
+  }
+
+  function refreshAll() {
+    usage.refreshAll(true)
+    spend.refresh()
+    fleet.refresh(true)
+    deepseek.refreshNow()
+    openrouter.refreshNow()
+  }
+
+  implicitWidth: button.implicitWidth
+  implicitHeight: button.implicitHeight
+
+  onOpenedChanged: {
+    // The key form starts clean on every opening and is cleared on every
+    // closing, so a half-typed key never outlives the panel.
+    openrouterTab.resetForm()
+    if (!opened) return
+    root.nowMs = Date.now()
+    // A fresh opening: the requested tab if something asked for one, the
+    // default otherwise, and the Limits rail back on the default provider.
+    root.tab = root.requestedTab !== "" ? root.requestedTab : root.defaultTab
+    root.requestedTab = ""
+    limitsTab.resetSelection()
+    // Limits is the cheapest useful refresh; the other four poll on their own
+    // and are refreshed when their tab is read or when the mark is right-clicked.
+    usage.refreshLimits()
+    if (root.tab === "spend") spend.refreshIfStale()
+    if (root.tab === "fleet") fleet.refresh(false)
+  }
+
+  // PgUp/PgDn never reach PanelKeyCatcher (it emits no signal for them), so
+  // the pane's other two keys are bound as window shortcuts while the panel is
+  // open.
+  Shortcut {
+    sequence: "PgDown"
+    enabled: root.opened
+    context: Qt.WindowShortcut
+    onActivated: root.active.movePane(1)
+  }
+
+  Shortcut {
+    sequence: "PgUp"
+    enabled: root.opened
+    context: Qt.WindowShortcut
+    onActivated: root.active.movePane(-1)
+  }
+
   Timer {
     interval: 30000
     running: root.opened
@@ -366,28 +256,80 @@ Panel {
 
   IpcHandler {
     target: root.ipcTarget
+
     function open(): void { root.open() }
     function close(): void { root.close() }
     function show(): void { root.open() }
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
-    function refresh(): string { root.refreshNow(); return "ok" }
-    function next(): string { root.selectProvider(root.providerIndex + 1); return "ok" }
+    function refresh(): string { root.refreshAll(); return "ok" }
+    function next(): string { root.cycleTab(1); return "ok" }
+    function tab(name: string): string {
+      if (!root.openOnTab(name)) return "unknown tab"
+      return "ok"
+    }
+    function setPeriod(period: string): string { spend.selectPeriod(String(period)); return "ok" }
   }
 
-  BarIconButton {
+  // -------------------------------------------------------------- bar mark
+  //
+  // OpticalGlyph inside a bar icon canvas, never a raw Text glyph, so the mark
+  // sits on the same optical baseline as every other bar icon. The mark never
+  // dims and never collapses: it is the only way into the five surfaces.
+  WidgetButton {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: "󱚣"
+    labelVisible: false
+    hasVisualContent: true
     active: root.alarming
-    onPressed: function(buttonCode) {
-      if (buttonCode === Qt.RightButton) root.launchAgent()
-      else if (buttonCode === Qt.MiddleButton) root.selectProvider(root.providerIndex + 1)
-      else root.toggle()
+    tooltipText: root.barTooltip
+    fixedWidth: button.vertical ? -1 : barContent.implicitWidth + Style.space(12)
+    fixedHeight: button.vertical ? barContent.implicitHeight + Style.space(12) : -1
+
+    onPressed: function(code) {
+      if (code === Qt.RightButton) root.refreshAll()
+      else if (code === Qt.MiddleButton) {
+        root.cycleTab(1)
+        root.open()
+      } else root.toggle()
+    }
+
+    Row {
+      id: barContent
+      anchors.centerIn: parent
+      spacing: Style.space(4)
+
+      Item {
+        anchors.verticalCenter: parent.verticalCenter
+        width: Style.bar.iconCanvas
+        height: Style.bar.iconCanvas
+
+        OpticalGlyph {
+          text: "󱚣"
+          anchors.fill: parent
+          color: button.active ? button.activeColor : button.foreground
+          fontFamily: button.fontFamily
+          fontSize: Style.bar.iconFont
+        }
+      }
+
+      Text {
+        anchors.verticalCenter: parent.verticalCenter
+        // A vertical bar has no room for a badge; the glyph and the tooltip
+        // carry the state there.
+        visible: !button.vertical && root.badgeText !== ""
+        textFormat: Text.PlainText
+        text: root.badgeText
+        color: button.active ? button.activeColor : button.foreground
+        font.family: button.fontFamily
+        font.pixelSize: Style.font.body
+        renderType: Text.NativeRendering
+      }
     }
   }
 
+  // ------------------------------------------------------------------ panel
   KeyboardPanel {
     id: panel
     anchorItem: button
@@ -395,581 +337,203 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(380))
-    // Taller than the control panels on purpose: this one is a dashboard, and
-    // the whole point is reading limits and history without scrolling.
+    // Two columns (rail + pane): wider than any single column this one
+    // replaces, and about half as tall. fittedContentWidth/Height still clamp
+    // both to the screen.
+    contentWidth: panel.fittedContentWidth(Style.space(950))
     contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(740))
 
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+      // The fleet filter and the OpenRouter key field are this panel's inline
+      // editors: while one has focus every keystroke belongs to it, which is
+      // what makes `/` and first-letter filtering work, and what keeps j, k,
+      // r and digits inside a pasted or typed key.
+      blocked: fleetTab.filterHasFocus || openrouterTab.keyFieldFocused
 
+      // The rail is a vertical list, so vertical motion (j/k, Up/Down) drives
+      // its chips and horizontal motion (h/l, Left/Right) drives the pane.
       onMoveRequested: function(dx, dy) {
-        if (dx !== 0) {
-          root.cursorActive = true
-          root.selectProvider(root.providerIndex + dx)
-        }
-        if (dy !== 0)
-          panelFlick.contentY = root.clamp(panelFlick.contentY + dy * Style.space(56), 0,
-                                           Math.max(0, panelFlick.contentHeight - panelFlick.height))
+        if (dy !== 0) root.active.moveRail(dy)
+        else if (dx !== 0) root.active.movePane(dx)
       }
-      onActivateRequested: root.refreshNow()
-      onCloseRequested: root.close()
+      onActivateRequested: root.active.activate()
+      onCloseRequested: {
+        if (root.tab === "fleet" && (fleetTab.filterHasFocus || fleetTab.filterText !== "")) fleetTab.clearFilter()
+        else if (openrouterTab.keyEditing) openrouterTab.cancelKeyEdit()
+        else root.close()
+      }
       onTabRequested: function(direction) { root.switchPanel(direction) }
-      onTextKey: function(t) { if (t === "r" || t === "R") root.refreshNow() }
+      onTextKey: function(text) {
+        if (text === "1") root.setTab("limits")
+        else if (text === "2") root.setTab("spend")
+        else if (text === "3") root.setTab("fleet")
+        else if (text === "4") root.setTab("deepseek")
+        else if (text === "5") root.setTab("openrouter")
+        else if (text === "[") root.cycleTab(-1)
+        else if (text === "]") root.cycleTab(1)
+        // Ctrl+j / Ctrl+k arrive as the ASCII control characters on Wayland,
+        // exactly like Ctrl+R above; they are the pane's scroll keys.
+        else if (text === "\n") root.active.movePane(1)
+        else if (text === "\u000b") root.active.movePane(-1)
+        // Ctrl+R arrives as the ASCII control character on Wayland; bare r
+        // refreshes too, matching the panels this one replaces.
+        else if (text === "r" || text === "R" || text === "\u0012") root.active.refresh()
+        // Fleet's own 1-4 view keys belong to the tab strip now, so its filter
+        // keeps the two entry points it still has: `/`, and any other printable.
+        else if (root.tab === "fleet" && text === "/") fleetTab.beginFilter("")
+        else if (root.tab === "fleet" && text >= " " && text !== "\u007f") fleetTab.beginFilter(text)
+      }
+      // PanelKeyCatcher claims x/X for deleteRequested before its printable
+      // branch, so that one character never reached the filter above — the
+      // README promises any printable on the Fleet tab starts the filter, and
+      // x was the single exception. Start it here instead. While the filter
+      // already has focus the catcher is `blocked`, so x still types straight
+      // into the field.
+      onDeleteRequested: if (root.tab === "fleet") fleetTab.beginFilter("x")
 
-      Flickable {
-        id: panelFlick
-        anchors.fill: parent
-        contentWidth: width
-        contentHeight: column.implicitHeight
-        clip: true
-        boundsBehavior: Flickable.StopAtBounds
-        flickableDirection: Flickable.VerticalFlick
-        interactive: contentHeight > height
-        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+      Column {
+        id: column
+        width: parent.width
+        spacing: Style.space(12)
 
-        Column {
-          id: column
-          width: panelFlick.width
-          spacing: Style.space(12)
+        // ---------- Hero: the active tab's mark, title, meta, pill ----------
+        PanelHero {
+          id: hero
+          width: parent.width
+          title: root.active.heroTitle
+          meta: root.active.heroMeta
+          detail: root.active.heroDetail
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          iconComponent: root.active.heroIcon
 
-          // ---------- Hero: provider mark · name · plan ----------
-          PanelHero {
-            id: hero
-            visible: !!root.provider
-            width: parent.width
-            title: root.provider ? root.provider.providerName : ""
-            meta: root.heroMeta(root.provider)
+          trailingControl: Component {
+            PanelActionButton {
+              iconText: "󰑐"  // nf-md-refresh
+              tooltipText: "Refresh " + root.tab + " (r)"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onClicked: root.active.refresh()
+            }
+          }
+        }
+
+        PanelSeparator {
+          foreground: root.foreground
+        }
+
+        // ---------- Tab strip ----------
+        ButtonGroup {
+          id: tabStrip
+          width: parent.width
+          options: root.tabs
+          value: root.tab
+          // Keys belong to PanelKeyCatcher; a Tab stop here would steal them.
+          focusable: false
+          cursorIndex: -1
+          foreground: root.foreground
+          accent: root.accent
+          fontFamily: root.fontFamily
+          fontSize: Style.font.bodySmall
+          onChanged: function(value) { root.tab = value }
+        }
+
+        // ---------- Tab host ----------
+        // All five tabs exist at once (no Loader): switching is instant, and a
+        // hot reload can never leave one on a stale version. Each tab owns its
+        // own scrolling, and only the active one is visible.
+        Item {
+          id: tabHost
+          width: column.width
+          // The taller of the tab's two columns, capped so the panel stays on
+          // screen. Only the pane inside the tab scrolls.
+          height: Math.min(Number(root.active.implicitContentHeight) || 0, Style.space(560))
+          clip: true
+
+          LimitsTab {
+            id: limitsTab
+            anchors.fill: parent
+            visible: root.tab === "limits"
+            usage: usage
+            // The rail's DeepSeek glance reads the service's own view; the
+            // poll and the key file stay in one place.
+            deepseek: deepseek
+            openrouter: openrouter
+            nowMs: root.nowMs
+            defaultProviderId: root.defaultProvider
             foreground: root.foreground
+            urgent: root.urgent
+            accent: root.accent
             fontFamily: root.fontFamily
-
-            iconComponent: Component {
-              Item {
-                id: heroMark
-                property var candidates: root.iconCandidatesForProvider(root.provider, root.surface)
-                // Provider objects are rebuilt on every refresh, which churns the
-                // array's identity without changing its content. Restart the fallback
-                // walk only when the URLs change: re-pointing source at a URL whose
-                // load already failed emits no statusChanged, so an identity-only
-                // reset would strand the walker on a missing -light twin.
-                property string candidatesKey: candidates.join("\n")
-                property int candidateIndex: 0
-                onCandidatesKeyChanged: candidateIndex = 0
-
-                width: Style.font.display
-                height: Style.font.display
-
-                Image {
-                  id: heroMarkImage
-                  anchors.fill: parent
-                  source: heroMark.candidateIndex < heroMark.candidates.length ? heroMark.candidates[heroMark.candidateIndex] : ""
-                  sourceSize.width: Style.font.display * 2
-                  sourceSize.height: Style.font.display * 2
-                  fillMode: Image.PreserveAspectFit
-                  // Advancing source from inside its own status change trips the
-                  // binding-loop detector; defer the step one tick.
-                  onStatusChanged: if (status === Image.Error && heroMark.candidateIndex < heroMark.candidates.length)
-                    Qt.callLater(function() { heroMark.candidateIndex++ })
-                }
-
-                Text {
-                  anchors.centerIn: parent
-                  visible: heroMarkImage.status !== Image.Ready
-                  text: button.text
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.display
-                }
-              }
-            }
           }
 
-          Text {
-            visible: root.providers.length === 0
-            width: parent.width
-            topPadding: Style.space(24)
-            text: "No AI coding subscriptions found.\nAgents show up here once you've used them."
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.body
-            horizontalAlignment: Text.AlignHCenter
-            wrapMode: Text.WordWrap
-          }
-
-          // ---------- Provider switch ----------
-          Row {
-            id: providerSwitch
-            visible: root.providers.length > 1
-            width: parent.width
-            spacing: Style.spacing.md
-
-            readonly property real cellWidth: root.providers.length > 0
-              ? (width - spacing * (root.providers.length - 1)) / root.providers.length
-              : 0
-
-            Repeater {
-              model: root.providers
-
-              Button {
-                required property var modelData
-                required property int index
-
-                width: providerSwitch.cellWidth
-                text: modelData.providerName
-                selected: index === root.providerIndex
-                hasCursor: root.cursorActive && index === root.providerIndex
-                bordered: true
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                fontSize: Style.font.bodySmall
-                verticalPadding: Style.spacing.controlPaddingY
-                onClicked: {
-                  root.cursorActive = true
-                  root.selectProvider(index)
-                }
-                onHovered: function(isHovered) { if (isHovered) root.cursorActive = true }
-              }
-            }
-          }
-
-          // ---------- Status ----------
-          BorderSurface {
-            visible: !!root.provider && String(root.provider.usageStatusText || "") !== ""
-            width: parent.width
-            implicitHeight: statusText.implicitHeight + Style.spacing.xl * 2
-            color: root.alpha(root.urgent, 0.10)
-            borderSpec: Border.flat(root.alpha(root.urgent, 0.35), 1)
-            radius: Style.cornerRadius
-
-            Text {
-              id: statusText
-              anchors.left: parent.left
-              anchors.right: parent.right
-              anchors.verticalCenter: parent.verticalCenter
-              anchors.leftMargin: Style.space(12)
-              anchors.rightMargin: Style.space(12)
-              text: root.provider ? String(root.provider.authHelpText || "") : ""
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.WordWrap
-            }
-          }
-
-          // ---------- Balance / limits ----------
-          PanelSeparator {
-            visible: balanceSection.visible || limitsSection.visible
+          SpendTab {
+            id: spendTab
+            anchors.fill: parent
+            visible: root.tab === "spend"
+            spend: spend
             foreground: root.foreground
+            urgent: root.urgent
+            accent: root.accent
+            fontFamily: root.fontFamily
           }
 
-          Column {
-            id: balanceSection
-            visible: !!root.balance
-            width: parent.width
-            spacing: Style.space(10)
-
-            // The meter shows what is left, not what is used: a prepaid
-            // account drains toward empty rather than filling toward a cap.
-            readonly property real ratio: root.balance && root.balance.funded > 0
-              ? root.clamp(root.balance.remaining / root.balance.funded, 0, 1)
-              : -1
-
-            PanelSectionHeader {
-              width: parent.width
-              text: "BALANCE"
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-            }
-
-            Item {
-              width: parent.width
-              implicitHeight: Math.max(balanceLabel.implicitHeight, balanceValue.implicitHeight)
-
-              Text {
-                id: balanceLabel
-                text: "Prepaid credits"
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.body
-                anchors.left: parent.left
-                anchors.verticalCenter: parent.verticalCenter
-              }
-
-              Text {
-                id: balanceValue
-                text: root.balance ? root.formatMoney(root.balance.remaining, root.balance.currency) : ""
-                color: root.balanceAlarming ? root.urgent : root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-              }
-            }
-
-            Meter {
-              visible: balanceSection.ratio >= 0
-              width: parent.width
-              value: balanceSection.ratio
-              alarming: root.balanceAlarming
-            }
-
-            Text {
-              visible: text !== ""
-              width: parent.width
-              text: root.balanceDetailText(root.balance)
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-            }
-          }
-
-          Column {
-            id: limitsSection
-            visible: root.limits.length > 0
-            width: parent.width
-            spacing: Style.space(10)
-
-            PanelSectionHeader {
-              text: "LIMITS"
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-            }
-
-            Repeater {
-              model: root.limits
-
-              LimitRow {
-                required property var modelData
-                width: limitsSection.width
-                window: modelData
-              }
-            }
-          }
-
-          // ---------- Usage ----------
-          PanelSeparator {
-            visible: usageSection.visible
+          FleetTab {
+            id: fleetTab
+            anchors.fill: parent
+            visible: root.tab === "fleet"
+            fleet: fleet
             foreground: root.foreground
+            urgent: root.urgent
+            accent: root.accent
+            fontFamily: root.fontFamily
           }
 
-          Column {
-            id: usageSection
-            visible: !!root.provider && root.provider.recentDays && root.provider.recentDays.length > 0
-            width: parent.width
-            spacing: Style.spacing.md
-
-            readonly property var days: root.provider ? (root.provider.recentDays || []) : []
-            readonly property real peak: Math.max(1, root.weekPeak(root.provider))
-
-            PanelSectionHeader {
-              width: parent.width
-              text: "TOKENS BY DAY"
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-            }
-
-            Repeater {
-              model: usageSection.days
-
-              DayRow {
-                required property var modelData
-                required property int index
-
-                width: usageSection.width
-                day: modelData
-                ratio: Number(modelData.messageCount || 0) / usageSection.peak
-                // By date, not by position: the Claude stats-cache fallback can
-                // hand us a window that stops short of today.
-                today: String(modelData.date || "") === root.todayDate()
-              }
-            }
-          }
-
-          // ---------- Models ----------
-          PanelSeparator {
-            visible: modelSection.visible
+          DeepSeekTab {
+            id: deepseekTab
+            anchors.fill: parent
+            visible: root.tab === "deepseek"
+            deepseek: deepseek
             foreground: root.foreground
+            urgent: root.urgent
+            accent: root.accent
+            fontFamily: root.fontFamily
           }
 
-          Column {
-            id: modelSection
-            visible: root.models.length > 0
-            width: parent.width
-            spacing: Style.spacing.md
-
-            PanelSectionHeader {
-              width: parent.width
-              text: "TOKENS BY MODEL"
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-            }
-
-            Repeater {
-              model: root.models
-
-              ModelRow {
-                required property var modelData
-                width: modelSection.width
-                row: modelData
-                // Scaled to the heaviest model, so the top row is always full —
-                // the same scale-to-peak the weekly chart uses for its busiest day.
-                share: modelData.total / Math.max(1, root.models[0].total)
-              }
-            }
-          }
-
-          Text {
-            visible: text !== ""
-            width: parent.width
-            topPadding: Style.space(2)
-            text: root.footerText()
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            horizontalAlignment: Text.AlignHCenter
-            elide: Text.ElideRight
+          OpenRouterTab {
+            id: openrouterTab
+            anchors.fill: parent
+            visible: root.tab === "openrouter"
+            openrouter: openrouter
+            nowMs: root.nowMs
+            foreground: root.foreground
+            urgent: root.urgent
+            accent: root.accent
+            fontFamily: root.fontFamily
+            // The form going away (key saved, edit cancelled) hands the keys
+            // back to the catcher.
+            onFormVisibleChanged: if (!openrouterTab.formVisible) Qt.callLater(root.focusCatcher)
+            onReleaseKeyFocus: keyCatcher.forceActiveFocus()
           }
         }
-      }
-    }
-  }
 
-  // A limit window: label and percentage, meter, and reset countdown.
-  component LimitRow: Column {
-    id: limitRow
-    property var window: null
-
-    readonly property bool alarming: window && window.percent >= 0.9
-
-    spacing: Style.space(6)
-
-    Item {
-      width: parent.width
-      implicitHeight: Math.max(limitLabel.implicitHeight, limitValue.implicitHeight)
-
-      Text {
-        id: limitLabel
-        // A model-scoped window is titled after its model, and those names run
-        // long enough to reach the percentage, so the title gives way first.
-        text: limitRow.window ? limitRow.window.title : ""
-        color: root.foreground
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.body
-        elide: Text.ElideRight
-        anchors.left: parent.left
-        anchors.right: limitValue.left
-        anchors.rightMargin: Style.spacing.sm
-        anchors.verticalCenter: parent.verticalCenter
-      }
-
-      Text {
-        id: limitValue
-        text: limitRow.window && limitRow.window.percent >= 0
-          ? Math.round(limitRow.window.percent * 100) + "%"
-          : "—"
-        color: limitRow.alarming ? root.urgent : root.foreground
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.caption
-        anchors.right: parent.right
-        anchors.verticalCenter: parent.verticalCenter
-      }
-    }
-
-    Meter {
-      width: parent.width
-      value: limitRow.window ? limitRow.window.percent : -1
-      alarming: limitRow.alarming
-    }
-
-    Text {
-      id: resetText
-      width: parent.width
-      text: {
-        var remainingMs = root.resetMsFor(limitRow.window)
-        if (remainingMs <= 0) return ""
-        var base = "Resets in " + root.formatDuration(remainingMs)
-        var delta = root.paceDelta(limitRow.window)
-        if (delta === 0) return base
-        return base + "  ·  " + Math.abs(Math.round(delta * 100)) + "% "
-             + (delta < 0 ? "behind pace" : "ahead of pace")
-      }
-      color: root.behindPace(limitRow.window) ? root.urgent : root.dim
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.caption
-    }
-  }
-
-  // Rounded track showing the percentage of the allowance used.
-  component Meter: Item {
-    id: meter
-    property real value: -1
-    property bool alarming: false
-    property real thickness: Math.max(Style.space(4), Math.round(Style.spacing.controlHeight * 0.14))
-
-    implicitHeight: thickness
-
-    Rectangle {
-      id: meterTrack
-      anchors.fill: parent
-      radius: height / 2
-      color: root.track
-    }
-
-    Rectangle {
-      anchors.left: meterTrack.left
-      anchors.verticalCenter: meterTrack.verticalCenter
-      height: meterTrack.height
-      radius: meterTrack.radius
-      width: meterTrack.width * root.clamp(meter.value, 0, 1)
-      color: meter.alarming ? root.urgent : root.foreground
-
-      Behavior on width {
-        NumberAnimation { duration: 160; easing.type: Easing.OutCubic }
-      }
-    }
-
-  }
-
-  // One row per day: label, bar, tokens. Today is picked out in full
-  // foreground so the week reads as a run-up to right now.
-  component DayRow: Item {
-    id: dayRow
-    property var day: null
-    property real ratio: 0
-    property bool today: false
-
-    implicitHeight: Math.max(dayLabel.implicitHeight, dayValue.implicitHeight) + Style.spacing.sm
-
-    Text {
-      id: dayLabel
-      text: root.dayLabel(dayRow.day ? dayRow.day.date : "", dayRow.today)
-      color: dayRow.today ? root.foreground : root.dim
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.caption
-      font.bold: dayRow.today
-      anchors.left: parent.left
-      anchors.verticalCenter: parent.verticalCenter
-      width: Style.space(52)
-    }
-
-    Rectangle {
-      id: dayTrack
-      anchors.left: dayLabel.right
-      anchors.right: dayValue.left
-      anchors.leftMargin: Style.space(8)
-      anchors.rightMargin: Style.space(10)
-      anchors.verticalCenter: parent.verticalCenter
-      height: Math.max(Style.space(4), Math.round(Style.spacing.controlHeight * 0.14))
-      radius: height / 2
-      color: root.track
-
-      Rectangle {
-        anchors.left: parent.left
-        anchors.verticalCenter: parent.verticalCenter
-        height: parent.height
-        radius: parent.radius
-        width: parent.width * root.clamp(dayRow.ratio, 0, 1)
-        color: dayRow.today ? root.foreground : root.alpha(root.foreground, 0.55)
-
-        Behavior on width {
-          NumberAnimation { duration: 160; easing.type: Easing.OutCubic }
+        // ---------- Keyboard legend ----------
+        Text {
+          textFormat: Text.PlainText
+          width: parent.width
+          // While the OpenRouter key field has the keys, the legend says the
+          // only two that do anything there.
+          text: openrouterTab.keyFieldFocused
+            ? "Enter save · Esc cancel"
+            : "1-5 tab · [ ] cycle · j/k rail · Ctrl+j/k scroll · r refresh · Esc close"
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          horizontalAlignment: Text.AlignHCenter
         }
       }
-    }
-
-    Text {
-      id: dayValue
-      text: usage.formatTokenCount(dayRow.day ? Number(dayRow.day.messageCount || 0) : 0)
-      color: dayRow.today ? root.foreground : root.dim
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.caption
-      font.bold: true
-      horizontalAlignment: Text.AlignRight
-      anchors.right: parent.right
-      anchors.verticalCenter: parent.verticalCenter
-      width: Style.space(52)
-    }
-
-    MouseArea {
-      id: dayHover
-      anchors.fill: parent
-      hoverEnabled: true
-      acceptedButtons: Qt.NoButton
-    }
-
-    PanelToolTip {
-      visible: dayHover.containsMouse
-      text: root.dayTooltip(dayRow.day, dayRow.today)
-      fontFamily: root.fontFamily
-    }
-  }
-
-  // Model rows read as a table: the share bar fills the row behind the label
-  // instead of stacking under it, which keeps the whole dashboard on one screen.
-  component ModelRow: Item {
-    id: modelRow
-    property var row: null
-    property real share: 0
-
-    implicitHeight: modelName.implicitHeight + Style.spacing.lg
-
-    Rectangle {
-      anchors.fill: parent
-      radius: Style.cornerRadius
-      color: root.alpha(root.foreground, 0.05)
-    }
-
-    Rectangle {
-      anchors.left: parent.left
-      anchors.top: parent.top
-      anchors.bottom: parent.bottom
-      width: parent.width * root.clamp(modelRow.share, 0, 1)
-      radius: Style.cornerRadius
-      color: root.alpha(root.foreground, 0.14)
-
-      Behavior on width {
-        NumberAnimation { duration: 160; easing.type: Easing.OutCubic }
-      }
-    }
-
-    Text {
-      id: modelName
-      text: modelRow.row ? modelRow.row.name : ""
-      color: root.foreground
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.bodySmall
-      elide: Text.ElideRight
-      anchors.left: parent.left
-      anchors.leftMargin: Style.space(8)
-      anchors.right: modelTokens.left
-      anchors.rightMargin: Style.space(8)
-      anchors.verticalCenter: parent.verticalCenter
-    }
-
-    Text {
-      id: modelTokens
-      text: modelRow.row ? usage.formatTokenCount(modelRow.row.total) : ""
-      color: root.dim
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.bodySmall
-      font.bold: true
-      anchors.right: parent.right
-      anchors.rightMargin: Style.space(8)
-      anchors.verticalCenter: parent.verticalCenter
-    }
-
-    MouseArea {
-      id: modelHover
-      anchors.fill: parent
-      hoverEnabled: true
-      acceptedButtons: Qt.NoButton
-    }
-
-    PanelToolTip {
-      visible: modelHover.containsMouse
-      text: root.modelTooltip(modelRow.row)
-      fontFamily: root.fontFamily
     }
   }
 }
