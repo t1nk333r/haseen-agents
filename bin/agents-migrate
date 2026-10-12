@@ -1,0 +1,101 @@
+#!/bin/bash
+# omarchy:summary=Copy this plugin's files from their Omarchy-era homes to haseen's, once
+# omarchy:hidden=true
+
+# The plugin used to keep its files under Omarchy's directories; they now live
+# under haseen's:
+#
+#   config  ~/.config/omarchy/openrouter/key
+#        -> ~/.config/haseen/agents/openrouter/key
+#   state   ~/.local/state/omarchy/agents/usage/*.json
+#        -> ~/.local/state/haseen/agents/usage/
+#           ~/.local/state/omarchy/t1nk33r.agents/{deepseek,openrouter}/*
+#        -> ~/.local/state/haseen/agents/{deepseek,openrouter}/
+#   cache   ~/.cache/omarchy/agent-usage/{omp,pi}-*.json (this plugin's
+#           collectors; the packaged ones keep theirs)
+#        -> ~/.cache/haseen/agents/agent-usage/
+#           ~/.cache/omarchy/agents-disabled.json
+#        -> ~/.cache/haseen/agents/agents-disabled.json
+#
+# ($XDG_CONFIG_HOME, $XDG_STATE_HOME and $XDG_CACHE_HOME move them; a relative
+# one is ignored, and with neither it nor HOME absolute nothing happens.)
+#
+# The entry points that read those files run this first: bin/agents-update,
+# bin/openrouter-credits and DeepSeekService's ledger setup. (The key saver
+# needs no migration: a key it writes is newer than the old file.) The
+# first run copies every old file whose new path is missing — never
+# overwriting, never deleting the old one (the owner removes those by hand) —
+# and then leaves a stamp, so a record a collector later drops is not brought
+# back from the old directory. Files land mode 600, directories 700. Two
+# instances (one per monitor) may start together: a lock serialises them and
+# each new file appears by an atomic link, never half-written.
+#
+# Prints nothing and always exits 0: a migration that cannot run must never
+# break the helper that called it.
+
+exec >/dev/null 2>&1
+umask 077
+
+base() { # base <XDG value> <fallback under HOME>
+  if [[ ${1:-} == /* ]]; then
+    printf '%s\n' "$1"
+  elif [[ ${HOME:-} == /* ]]; then
+    printf '%s\n' "$HOME/$2"
+  fi
+}
+
+config=$(base "${XDG_CONFIG_HOME:-}" .config)
+state=$(base "${XDG_STATE_HOME:-}" .local/state)
+cache=$(base "${XDG_CACHE_HOME:-}" .cache)
+[[ -n $config && -n $state && -n $cache ]] || exit 0
+
+root="$state/haseen/agents"
+stamp="$root/.migrated-from-omarchy"
+[[ -e $stamp ]] && exit 0
+
+mkdir -p -- "$root" || exit 0
+exec 9>"$root/.migrate.lock" || exit 0
+flock 9 || exit 0
+[[ -e $stamp ]] && exit 0
+
+failed=0
+
+# copy <old file> <new file>: only a regular file of ours, only onto nothing.
+copy() {
+  local old=$1 new=$2 dir tmp
+  [[ -e $new || -L $new ]] && return 0
+  [[ -f $old && ! -L $old && -O $old ]] || return 0
+  dir=${new%/*}
+  mkdir -p -- "$dir" && chmod 700 -- "$dir" || { failed=1; return 0; }
+  tmp=$(mktemp "$dir/.migrate.XXXXXX") || { failed=1; return 0; }
+  if cp --preserve=timestamps -- "$old" "$tmp" && chmod 600 -- "$tmp"; then
+    # ln fails when $new appeared meanwhile, which is the no-overwrite rule.
+    ln -- "$tmp" "$new" 2>/dev/null || [[ -e $new ]] || failed=1
+  else
+    failed=1
+  fi
+  rm -f -- "$tmp"
+}
+
+# copy_dir <old dir> <new dir> <glob>...: every matching regular file, one level.
+copy_dir() {
+  local old=$1 new=$2 pattern file
+  shift 2
+  [[ -d $old && ! -L $old ]] || return 0
+  for pattern in "$@"; do
+    for file in "$old"/$pattern; do
+      [[ -f $file ]] && copy "$file" "$new/${file##*/}"
+    done
+  done
+}
+
+copy "$config/omarchy/openrouter/key" "$config/haseen/agents/openrouter/key"
+copy_dir "$state/omarchy/agents/usage" "$root/usage" '*.json'
+copy_dir "$state/omarchy/t1nk33r.agents/deepseek" "$root/deepseek" usage.state alerts.state alerts.gate
+copy_dir "$state/omarchy/t1nk33r.agents/openrouter" "$root/openrouter" today-spend.json
+copy_dir "$cache/omarchy/agent-usage" "$cache/haseen/agents/agent-usage" 'omp-*.json' 'pi-*.json'
+copy "$cache/omarchy/agents-disabled.json" "$cache/haseen/agents/agents-disabled.json"
+
+# A failed copy is tried again on the next run; only a clean pass is final.
+(( failed == 0 )) && : > "$stamp"
+exit 0

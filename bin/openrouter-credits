@@ -1,0 +1,614 @@
+#!/usr/bin/bash -p
+# openrouter-credits — what an OpenRouter account and key have left and have
+# spent, as ONE JSON object on stdout. Takes no arguments. Always exits 0: a
+# failure is reported inside the JSON ("ok": false), never as an exit code, a
+# crash or stderr text, so the panel always has something to render.
+#
+# ─── Output (every key is always present; null = unknown) ────────────────────
+#   ok                bool    false only when no figure at all was obtained
+#                             (no key, rejected key, unreachable, unusable replies)
+#   error             string  why ok=false ("" otherwise); never contains the key
+#   hint              string  next step for the owner ("" if none)
+#   noKey             bool    true ONLY when no key was found in any source (the
+#                             "No OpenRouter API key found" answer); false for
+#                             every other failure and for success
+#   needsManagementKey bool   true iff /credits answered 403 (not a management key)
+#   keySource         string  "OPENROUTER_API_KEY" | "OPENROUTER_KEY" |
+#                             absolute path of the key file | "" (no key found)
+#   keyKind           string  "management" (the /credits ledger answered, or /key
+#                             says is_management_key) | "inference" (/key
+#                             answered, not management) | "unknown"
+#   source            string  where `remaining` comes from: "account" (funded and
+#                             spent known) | "key" (the key's limit_remaining) |
+#                             "usage" (only the key's own usage known) | "none"
+#   fetchedAt         number  epoch seconds of this poll
+#   accountError, keyError, activityError
+#                     string  why that part is unavailable ("" when fine), from
+#                             the fixed vocabulary below. /credits 403 ->
+#                             accountError and activityError are "needs a
+#                             management key".
+#   funded, spent     number|null  /credits total_credits, total_usage
+#   remaining         number|null  funded-spent, else keyLimitRemaining, else null
+#   keyLabel          string  computed LOCALLY from the key in use, never read from
+#                             the server: "sk-or-v1-..." + its last 4 characters
+#                             (or "..." + last 4 without that prefix); "" when no
+#                             valid key was found
+#   keyLimit, keyLimitRemaining   number|null   the key's spend cap and what is left
+#   keyLimitReset     string  exactly "daily" | "weekly" | "monthly", else ""
+#   keyUsage, keyUsageDaily, keyUsageWeekly, keyUsageMonthly
+#                     number|null  key-scoped spend (UTC day/week/month) from /key
+#   freeTier          bool    /key is_free_tier
+#   spendToday        number|null  account-wide spend this UTC day (needs /credits
+#                             and a usable state directory)
+#   spendTodaySince   number|null  epoch the spendToday baseline was taken at
+#   usageWeekly, usageMonthly
+#                     number|null  account-wide: /activity rows whose date starts
+#                             YYYY-MM-DD and lies strictly before today (UTC), on or
+#                             after this UTC week's Monday / in this UTC month,
+#                             numeric `usage` only, plus spendToday when known.
+#                             null when /activity is unavailable.
+#
+# ─── Requests (at most 3, sequential, base https://openrouter.ai/api/v1) ─────
+#   1. GET /credits   management keys only. 401 -> stop, "OpenRouter rejected the
+#                     key". No connection/timeout -> stop, "Could not reach
+#                     openrouter.ai". 403 -> not a management key; noted in
+#                     accountError and needsManagementKey, not an error.
+#   2. GET /key       any key: label, cap, key-scoped usage.
+#   3. GET /activity  ONLY when /credits answered 200 with a usable ledger; the
+#                     last 30 completed UTC days (never today).
+#   A 200 whose body is not the documented object counts as unusable.
+#   Messages (error, accountError, keyError, activityError) come from a FIXED
+#   vocabulary picked by transport state and HTTP status, never from a body:
+#   unreachable "Could not reach openrouter.ai"; too large "OpenRouter's reply
+#   was too large"; incomplete "OpenRouter's reply was cut off"; unusable 200
+#   "OpenRouter returned an unusable reply"; 401 "OpenRouter rejected the key";
+#   402 "The OpenRouter account is out of credit"; 403 on /credits "needs a
+#   management key", on any other call "OpenRouter refused the request"; 429
+#   "Rate limited by OpenRouter"; else "OpenRouter returned HTTP <n>".
+#
+# ─── Today's spend ────────────────────────────────────────────────────────────
+#   /activity never reports the current UTC day, so today's spend is the live
+#   /credits total_usage minus a baseline kept in
+#   ${XDG_STATE_HOME:-~/.local/state}/haseen/agents/openrouter/today-spend.json
+#   = {"date":"YYYY-MM-DD" (UTC),"baseline":<total_usage>,"keyLabel":"…","at":<epoch>}.
+#   The baseline's keyLabel is the locally computed label above, so it always
+#   exists (a /key failure cannot blank it). Same UTC date and the same label ->
+#   spendToday = max(0, total_usage - baseline), spendTodaySince = at.
+#   Otherwise (another day, or another key, e.g. a replaced key file) a new
+#   baseline is written (= total_usage, at = now) and spendToday = 0.
+#   Best-effort: a failure never fails the fetch. The baseline is skipped
+#   (spendToday null) when the state directory is a symlink, is not owned by the
+#   caller or cannot be set to mode 700, when today-spend.json is a symlink, a
+#   directory or cannot be set to mode 600, or when neither XDG_STATE_HOME nor
+#   HOME is an absolute path.
+#
+# ─── Key resolution (first hit wins; whitespace is stripped from the value) ──
+#   1. $OPENROUTER_API_KEY   2. $OPENROUTER_KEY
+#   3. ${XDG_CONFIG_HOME:-~/.config}/haseen/agents/openrouter/key
+#   4. ${XDG_CONFIG_HOME:-~/.config}/openrouter/key
+#   A relative XDG_CONFIG_HOME is ignored; without an absolute XDG_CONFIG_HOME or
+#   HOME the files are skipped. A file's key is its first line that is neither
+#   blank nor a `#` comment (a leading UTF-8 BOM is dropped; a line longer than
+#   4096 bytes is discarded whole, it can never be a key). The key file may be a
+#   symlink (the owner's choice). An empty variable or a file with no such line
+#   is not a hit. There is deliberately no setting that runs a command.
+#
+# ─── Security rules ──────────────────────────────────────────────────────────
+#   * `bash -p` (shebang): BASH_ENV, ENV, SHELLOPTS, BASHOPTS and exported
+#     functions from the environment are ignored, so an inherited `xtrace` or
+#     startup hook cannot print or copy the key; `set +x` follows anyway.
+#   * LC_ALL=C before anything else, so the allowlist below is ASCII in every
+#     locale and lengths are bytes.
+#   * The key must match ^[A-Za-z0-9._~+/=-]{16,256}$ before any use; anything
+#     else -> "That is not a valid OpenRouter key" and no request. This is what
+#     makes it safe to place inside the quoted curl config below (no quote,
+#     backslash or newline can reach it).
+#   * The key never appears in argv, in the environment of any child (both key
+#     variables, and every internal variable name, are unset/un-exported before
+#     a child runs), on stdout/stderr, in the JSON or on disk. curl gets it only
+#     inside a config read from stdin (`curl -q --config -`). Limits: a key
+#     supplied through the environment is, by nature, visible in this helper's
+#     own initial /proc/<pid>/environ (and that of the panel that launched it);
+#     the key file is the recommended source.
+#   * -q only stops curl reading ~/.curlrc. The rest of the environment (PATH,
+#     proxy variables, CA bundle and CURL_* settings) is the owner's trusted
+#     launch environment and is deliberately NOT reset or scrubbed.
+#   * $OPENROUTER_API_BASE (a test hook) is honoured only when it matches
+#     ^http://(127\.0\.0\.1|localhost):[0-9]{1,5}(/[A-Za-z0-9._~/-]*)?$ ;
+#     any other non-empty value -> "OPENROUTER_API_BASE must be a loopback URL"
+#     and no request. For that hook curl also gets `noproxy = "*"`, so a proxy
+#     variable can never receive the Bearer header over plain http; the real
+#     HTTPS endpoint keeps the owner's proxy (a CONNECT tunnel stays encrypted).
+#   * curl runs with proto "=https" ("=http" for the loopback hook only),
+#     max-time 8, connect-timeout 4, max-filesize 1 MiB, no redirect following,
+#     a fixed user-agent, under `timeout -k 1 10` (when coreutils' timeout is on
+#     PATH) so a hung curl cannot outlive the helper. Worst case ~30 s per poll.
+#   * Replies are untrusted and never written to disk: the body is held in
+#     memory and parsed by jq; a figure counts only when it is a JSON number.
+#     NO server-supplied free text is ever copied into the output, the baseline
+#     file or any child's argv: messages are fixed strings (see above), the
+#     reset period is one of three literal words, and the server's label field
+#     is not read at all. Consequence: the key appears in the output only as
+#     "sk-or-v1-..." plus its last 4 characters, computed locally from the key
+#     itself, never from the server. The scratch directory holds only validated
+#     numbers, booleans, dates and that enum.
+#   * State: directory mode 700, today-spend.json mode 600 (both re-applied on
+#     every run), written via a temp file in the same directory and `mv -fT`.
+#     It holds no key; its keyLabel is the local label.
+#
+# ─── Trust boundaries (what is NOT defended) ─────────────────────────────────
+#   * Launch environment: PATH, proxy variables, the CA bundle and CURL_*
+#     variables are trusted for the real HTTPS endpoint; a malicious tool on
+#     PATH or an interception CA can see the key. The loopback test hook
+#     bypasses proxies.
+#   * Storage: the key and state directories must have owner-controlled
+#     ancestors. openrouter-save-key refuses a symlinked key directory or key
+#     path, and the today baseline is skipped for a symlinked state directory
+#     or state file; but READING a key file that is itself a symlink is
+#     intentionally allowed (the owner's choice). No directory descriptor is
+#     held, so a path swap by something that already controls an ancestor
+#     directory is out of scope.
+#   * Same UID: another process running as this user can read the key file, an
+#     environment-supplied key in /proc/<pid>/environ of this helper and of its
+#     forked subshells, and the stdin pipe while curl consumes it.
+#   * The key is not erased from process memory or core dumps.
+#   * The today baseline's label is the local label of the key in use: it
+#     detects a key switch (including a hand-edited key file), not account
+#     identity; two keys of one account are treated as different.
+#   * The API server already holds the key by design. A hostile server can put
+#     any NUMBER in a balance field, including digits copied from the key, and
+#     nothing here defends against that. What IS defended: the helper never
+#     writes the key itself to argv, the environment, stderr, scratch files or
+#     state, and never copies server TEXT into its output; numbers are accepted
+#     only as JSON numbers, bounded by the display rules in OpenRouterModel.js.
+#   * A key replaced by hand-editing the key file is not reported as a
+#     replacement to the panel (only a panel save invalidates displayed
+#     figures); the baseline does reset, because the local label changes.
+
+set +x
+export LC_ALL=C
+set -uo pipefail
+umask 077
+
+# Every internal name, unset first: a same-named variable exported by the
+# caller would otherwise stay exported (locals inherit it) and carry the key or
+# server text into a child's environment.
+unset -v api_key key_source file_key candidate key_path config_home state_home \
+  work now today month_prefix week_start ok error hint no_key needs_mgmt \
+  account_error key_error activity_error key_label key_limit_reset key_kind \
+  base proto http_status transport body raw rc code line rest bom label \
+  first part credits_usable key_usable key_status_note state_dir today_file tmp \
+  timeout_cmd v
+api_key="" key_source="" file_key=""
+
+readonly KEY_RE='^[A-Za-z0-9._~+/=-]{16,256}$'
+readonly LOOPBACK_RE='^http://(127\.0\.0\.1|localhost):[0-9]{1,5}(/[A-Za-z0-9._~/-]*)?$'
+readonly DEFAULT_BASE='https://openrouter.ai/api/v1'
+readonly MAX_BODY=1048576
+readonly CHUNK=4096
+
+# ── Key resolution, first, with builtins only: no child process exists until
+# both key variables are gone from the environment. ──────────────────────────
+if [[ ${XDG_CONFIG_HOME:-} == /* ]]; then
+  config_home=$XDG_CONFIG_HOME
+elif [[ ${HOME:-} == /* ]]; then
+  config_home="$HOME/.config"
+else
+  config_home=""
+fi
+
+# Sets file_key to the first non-blank, non-comment line of $1, whitespace
+# stripped. Reads in $CHUNK-byte pieces; a piece that fills the chunk is part
+# of an over-long line, and that whole line (its continuation included) is
+# thrown away, so a long comment can never leak its tail as a key.
+key_from_file() {
+  local line rest bom=yes
+  file_key=""
+  [[ -f $1 && -r $1 ]] || return 1
+  while IFS= read -r -n "$CHUNK" line || [[ -n $line ]]; do
+    if (( ${#line} >= CHUNK )); then
+      while IFS= read -r -n "$CHUNK" rest && (( ${#rest} >= CHUNK )); do :; done
+      bom=no
+      continue
+    fi
+    if [[ $bom == yes ]]; then
+      line=${line#$'\xef\xbb\xbf'}
+      bom=no
+    fi
+    line=${line//[[:space:]]/}
+    [[ -z $line || $line == \#* ]] && continue
+    file_key=$line
+    return 0
+  done < "$1"
+  return 1
+}
+
+candidate=${OPENROUTER_API_KEY:-}
+candidate=${candidate//[[:space:]]/}
+if [[ -n $candidate ]]; then
+  api_key=$candidate key_source=OPENROUTER_API_KEY
+else
+  candidate=${OPENROUTER_KEY:-}
+  candidate=${candidate//[[:space:]]/}
+  if [[ -n $candidate ]]; then
+    api_key=$candidate key_source=OPENROUTER_KEY
+  elif [[ -n $config_home ]]; then
+    for key_path in "$config_home/haseen/agents/openrouter/key" "$config_home/openrouter/key"; do
+      if key_from_file "$key_path"; then
+        api_key=$file_key key_source=$key_path
+        break
+      fi
+    done
+  fi
+fi
+unset -v OPENROUTER_API_KEY OPENROUTER_KEY candidate file_key
+
+# ── Output ───────────────────────────────────────────────────────────────────
+# Last resort when jq itself or a scratch directory is missing: the same
+# shape, written by hand. $1/$2 are fixed literals; the key source is escaped.
+static_fail() {
+  local v=$key_source
+  v=${v//\\/\\\\}
+  v=${v//\"/\\\"}
+  v=${v//[[:cntrl:]]/}
+  printf '{"ok":false,"error":"%s","hint":"%s","noKey":false,"needsManagementKey":false,"keySource":"%s","keyKind":"unknown","source":"none","fetchedAt":%s,"accountError":"","keyError":"","activityError":"","funded":null,"spent":null,"remaining":null,"keyLabel":"","keyLimit":null,"keyLimitRemaining":null,"keyLimitReset":"","keyUsage":null,"keyUsageDaily":null,"keyUsageWeekly":null,"keyUsageMonthly":null,"freeTier":false,"spendToday":null,"spendTodaySince":null,"usageWeekly":null,"usageMonthly":null}\n' \
+    "$1" "$2" "$v" "$(date +%s)"
+  exit 0
+}
+
+command -v jq >/dev/null 2>&1 || static_fail "jq is not installed" "Install jq: omarchy pkg add jq"
+
+work=$(mktemp -d "${TMPDIR:-/tmp}/openrouter-credits.XXXXXX" 2>/dev/null) \
+  || static_fail "Could not create a scratch directory" ""
+trap 'rm -rf -- "$work"' EXIT
+for part in credits key activity today; do
+  printf 'null\n' > "$work/$part.json"
+done
+
+now=$(date -u +%s)
+today=$(date -u -d "@$now" +%F)
+month_prefix=$(date -u -d "@$now" +%Y-%m)
+week_start=$(date -u -d "@$(( now - ($(date -u -d "@$now" +%u) - 1) * 86400 ))" +%F)
+
+ok=false error="" hint="" no_key=false needs_mgmt=false
+account_error="" key_error="" activity_error=""
+key_label="" key_limit_reset="" key_kind=unknown
+
+emit() {
+  jq -n -c \
+    --slurpfile c "$work/credits.json" \
+    --slurpfile k "$work/key.json" \
+    --slurpfile a "$work/activity.json" \
+    --slurpfile t "$work/today.json" \
+    --arg ok "$ok" --arg error "$error" --arg hint "$hint" \
+    --arg noKey "$no_key" --arg needsManagementKey "$needs_mgmt" \
+    --arg keySource "$key_source" --arg keyKind "$key_kind" \
+    --arg accountError "$account_error" --arg keyError "$key_error" \
+    --arg activityError "$activity_error" \
+    --arg keyLabel "$key_label" --arg keyLimitReset "$key_limit_reset" \
+    --arg today "$today" --arg weekStart "$week_start" --arg monthPrefix "$month_prefix" \
+    --argjson now "$now" '
+    ($c[0]) as $c | ($k[0]) as $k | ($t[0]) as $t |
+    ($a[0] | if type == "array" then map(select(.date < $today)) else null end) as $a |
+    ($t | if type == "object" then .spendToday else null end) as $spend |
+    ($a | if . == null then null
+          else [.[] | select(.date >= $weekStart) | .usage] | add // 0 end) as $weekSettled |
+    ($a | if . == null then null
+          else [.[] | select(.date | startswith($monthPrefix)) | .usage] | add // 0 end) as $monthSettled |
+    {
+      ok: ($ok == "true"),
+      error: $error,
+      hint: $hint,
+      noKey: ($noKey == "true"),
+      needsManagementKey: ($needsManagementKey == "true"),
+      keySource: $keySource,
+      keyKind: $keyKind,
+      source: "none",
+      fetchedAt: $now,
+      accountError: $accountError,
+      keyError: $keyError,
+      activityError: $activityError,
+      funded: $c.funded,
+      spent: $c.spent,
+      remaining: null,
+      keyLabel: $keyLabel,
+      keyLimit: $k.limit,
+      keyLimitRemaining: $k.limitRemaining,
+      keyLimitReset: $keyLimitReset,
+      keyUsage: $k.usage,
+      keyUsageDaily: $k.usageDaily,
+      keyUsageWeekly: $k.usageWeekly,
+      keyUsageMonthly: $k.usageMonthly,
+      freeTier: ($k.freeTier == true),
+      spendToday: $spend,
+      spendTodaySince: ($t | if type == "object" then .since else null end),
+      usageWeekly: (if $weekSettled == null then null
+                    elif $spend != null then $weekSettled + $spend
+                    else $weekSettled end),
+      usageMonthly: (if $monthSettled == null then null
+                     elif $spend != null then $monthSettled + $spend
+                     else $monthSettled end)
+    }
+    | .remaining = (if .funded != null and .spent != null then .funded - .spent
+                    elif .keyLimitRemaining != null then .keyLimitRemaining
+                    else null end)
+    | .source = (if .funded != null and .spent != null then "account"
+                 elif .keyLimitRemaining != null then "key"
+                 elif .keyUsage != null then "usage"
+                 else "none" end)
+  ' 2>/dev/null || static_fail "Could not assemble the result" ""
+  exit 0
+}
+
+fail() {
+  ok=false error=$1 hint=${2:-}
+  emit
+}
+
+if [[ -z $api_key ]]; then
+  no_key=true
+  fail "No OpenRouter API key found" "Paste a key in the panel, or export OPENROUTER_API_KEY."
+fi
+[[ $api_key =~ $KEY_RE ]] || fail "That is not a valid OpenRouter key" \
+  "Replace it below, or create a new one at openrouter.ai/settings/management-keys."
+
+# The label, computed locally from the key we hold (never from the server):
+# the public format prefix when present, then the key's last 4 characters.
+if [[ $api_key == sk-or-v1-* ]]; then
+  key_label="sk-or-v1-...${api_key: -4}"
+else
+  key_label="...${api_key: -4}"
+fi
+
+command -v curl >/dev/null 2>&1 || fail "curl is not installed" "Install curl: omarchy pkg add curl"
+
+# ── API base: the real one, or a loopback test server and nothing else. ──────
+base=${OPENROUTER_API_BASE:-}
+unset -v OPENROUTER_API_BASE
+if [[ -z $base ]]; then
+  base=$DEFAULT_BASE proto='=https'
+elif [[ $base =~ $LOOPBACK_RE ]]; then
+  proto='=http'
+  while [[ $base == */ ]]; do base=${base%/}; done
+else
+  fail "OPENROUTER_API_BASE must be a loopback URL" "Unset OPENROUTER_API_BASE; it only exists for tests."
+fi
+
+timeout_cmd=()
+command -v timeout >/dev/null 2>&1 && timeout_cmd=(timeout -k 1 10)
+
+# ── HTTP ─────────────────────────────────────────────────────────────────────
+# Sets body (in memory only), http_status (three digits, 000 = no answer) and
+# transport ("" when body is complete, else unreachable | too_large | incomplete).
+http_status=000 transport="" body=""
+fetch() {
+  local raw rc
+  body="" http_status=000 transport=""
+  {
+    raw=$(
+      {
+        printf '%s\n' \
+          'silent' \
+          "proto = \"$proto\"" \
+          'max-time = 8' \
+          'connect-timeout = 4' \
+          "max-filesize = $MAX_BODY" \
+          'user-agent = "t1nk33r.agents-openrouter/1.0"' \
+          "header = \"Authorization: Bearer $api_key\"" \
+          "url = \"$base/$1\""
+        if [[ $proto == '=http' ]]; then printf '%s\n' 'noproxy = "*"'; fi
+      } | "${timeout_cmd[@]}" curl -q --config - --write-out '\n%{http_code}' 2>/dev/null
+    )
+    rc=$?
+  } 2>/dev/null
+  # The write-out is exactly "\n" + three digits; split by length, not by
+  # pattern (a pattern match over a 1 MiB body is quadratic in bash).
+  if (( ${#raw} >= 4 )) && [[ ${raw: -4:1} == $'\n' && ${raw: -3} =~ ^[0-9]{3}$ ]]; then
+    http_status=${raw: -3}
+    body=${raw:0:${#raw}-4}
+  fi
+  if (( rc == 63 )); then
+    transport=too_large
+  elif (( rc != 0 )); then
+    if [[ $http_status == 000 ]]; then transport=unreachable; else transport=incomplete; fi
+  elif (( ${#body} > MAX_BODY )); then
+    transport=too_large
+  fi
+  [[ -z $transport ]] || body=""
+}
+
+# The reason the last fetch of endpoint $1 is unusable, from a FIXED
+# vocabulary chosen by transport state and HTTP status alone. The body is never
+# read for a message: no server-supplied free text reaches our output.
+reason() {
+  case $transport in
+    unreachable) printf 'Could not reach openrouter.ai'; return ;;
+    too_large) printf "OpenRouter's reply was too large"; return ;;
+    incomplete) printf "OpenRouter's reply was cut off"; return ;;
+  esac
+  case $http_status in
+    200) printf 'OpenRouter returned an unusable reply' ;;
+    401) printf 'OpenRouter rejected the key' ;;
+    402) printf 'The OpenRouter account is out of credit' ;;
+    403)
+      if [[ $1 == credits ]]; then printf 'needs a management key'
+      else printf 'OpenRouter refused the request'; fi ;;
+    429) printf 'Rate limited by OpenRouter' ;;
+    *) printf 'OpenRouter returned HTTP %s' "$http_status" ;;
+  esac
+}
+
+# Normalises the last body with jq program $2 into $work/$1.json (null when
+# the reply is not one usable JSON value) and returns 0 when it is usable.
+# Only numbers, booleans and validated dates reach that file.
+normalise() {
+  if [[ -z $transport && $http_status == 200 ]] \
+     && printf '%s' "$body" \
+        | jq -c -s 'if length == 1 then .[0] | ('"$2"') else null end' \
+          > "$work/$1.json" 2>/dev/null; then
+    local first=""
+    IFS= read -r first < "$work/$1.json"
+    [[ -n $first && $first != null ]] && return 0
+  fi
+  printf 'null\n' > "$work/$1.json"
+  return 1
+}
+
+# ── 1. /credits ──────────────────────────────────────────────────────────────
+credits_usable=false
+fetch credits
+if [[ $transport == unreachable ]]; then
+  fail "Could not reach openrouter.ai" "Check the network connection."
+fi
+if [[ -z $transport && $http_status == 401 ]]; then
+  account_error=$(reason credits)
+  fail "OpenRouter rejected the key" "Replace it below, or create a new one at openrouter.ai/settings/management-keys."
+fi
+if normalise credits 'if type == "object" and (.data | type) == "object"
+                         and (.data.total_credits | type) == "number"
+                         and (.data.total_usage | type) == "number"
+                      then {funded: .data.total_credits, spent: .data.total_usage}
+                      else null end'; then
+  credits_usable=true
+elif [[ -z $transport && $http_status == 403 ]]; then
+  needs_mgmt=true
+  account_error="needs a management key"
+  activity_error="needs a management key"
+else
+  account_error=$(reason credits)
+  activity_error="skipped: the account ledger was unavailable"
+fi
+
+# ── 2. /key ──────────────────────────────────────────────────────────────────
+key_usable=false
+key_status_note=""
+fetch key
+if normalise key 'if type == "object" and (.data | type) == "object" then
+                    .data
+                    | def num: if type == "number" then . else null end;
+                      {limit: (.limit | num), limitRemaining: (.limit_remaining | num),
+                       usage: (.usage | num), usageDaily: (.usage_daily | num),
+                       usageWeekly: (.usage_weekly | num),
+                       usageMonthly: (.usage_monthly | num),
+                       freeTier: (.is_free_tier == true),
+                       management: (.is_management_key == true),
+                       limitReset: (.limit_reset
+                         | if . == "daily" or . == "weekly" or . == "monthly"
+                           then . else "" end)}
+                  else null end'; then
+  key_usable=true
+  # The server's label is never read: keyLabel is computed locally (above).
+  # The reset period is an enum: only these three literal words are kept.
+  case $(jq -j '.limitReset' "$work/key.json" 2>/dev/null) in
+    daily) key_limit_reset=daily ;;
+    weekly) key_limit_reset=weekly ;;
+    monthly) key_limit_reset=monthly ;;
+  esac
+else
+  key_error=$(reason key)
+  if [[ $transport == unreachable ]]; then
+    key_status_note="Could not reach openrouter.ai"
+  elif [[ -z $transport && $http_status == 401 ]]; then
+    key_status_note="OpenRouter rejected the key"
+  fi
+fi
+
+# ── 3. /activity (management keys only, so only after a usable ledger) ──────
+if $credits_usable; then
+  fetch activity
+  normalise activity 'if type == "object" and (.data | type) == "array" then
+                        [.data[] | select(type == "object")
+                         | select((.date | type) == "string"
+                                  and (.date | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}"))
+                                  and (.usage | type) == "number")
+                         | {date: .date[0:10], usage: .usage}]
+                      else null end' \
+    || activity_error=$(reason activity)
+fi
+body=""
+
+if $credits_usable; then
+  key_kind=management
+elif $key_usable; then
+  if [[ $(jq -r '.management' "$work/key.json" 2>/dev/null) == true ]]; then
+    key_kind=management
+  else
+    key_kind=inference
+  fi
+fi
+
+if ! $credits_usable && ! $key_usable; then
+  if [[ -n $key_status_note ]]; then
+    error=$key_status_note
+  else
+    error=${key_error:-$account_error}
+  fi
+  fail "$error" "Check the key at openrouter.ai/settings/management-keys."
+fi
+ok=true
+
+# ── Today's spend against the stored baseline (best-effort) ─────────────────
+# Returns 0 when the state directory and file are safe to use: real (not a
+# symlink), owned by us, and hardened to 700/600 on this very run.
+state_ready() {
+  if [[ -L $state_dir ]]; then return 1; fi
+  if [[ ! -e $state_dir ]]; then
+    mkdir -p -- "$state_dir" 2>/dev/null || return 1
+  fi
+  [[ ! -L $state_dir && -d $state_dir && -O $state_dir ]] || return 1
+  chmod 700 -- "$state_dir" 2>/dev/null || return 1
+  if [[ -L $today_file ]]; then return 1; fi
+  if [[ -e $today_file ]]; then
+    [[ -f $today_file && -O $today_file ]] || return 1
+    chmod 600 -- "$today_file" 2>/dev/null || return 1
+  fi
+  return 0
+}
+
+if $credits_usable; then
+  if [[ ${XDG_STATE_HOME:-} == /* ]]; then
+    state_home=$XDG_STATE_HOME
+  elif [[ ${HOME:-} == /* ]]; then
+    state_home="$HOME/.local/state"
+  else
+    state_home=""
+  fi
+  state_dir="$state_home/haseen/agents/openrouter"
+  today_file="$state_dir/today-spend.json"
+
+  if [[ -n $state_home ]] && state_ready; then
+    # The stored baseline, or null when absent, unreadable or malformed.
+    if [[ -f $today_file ]] && jq -c -s '
+          if length == 1 and (.[0] | type) == "object"
+             and (.[0].date | type) == "string" and (.[0].baseline | type) == "number"
+             and (.[0].keyLabel | type) == "string" and (.[0].at | type) == "number"
+          then .[0] | {date, baseline, keyLabel, at} else null end' \
+          "$today_file" > "$work/baseline.json" 2>/dev/null; then
+      :
+    else
+      printf 'null\n' > "$work/baseline.json"
+    fi
+
+    if jq -n -c --slurpfile c "$work/credits.json" --slurpfile b "$work/baseline.json" \
+         --arg today "$today" --arg label "$key_label" --argjson now "$now" '
+         ($c[0].spent) as $spent | ($b[0]) as $b |
+         if $b != null and $b.date == $today and $b.keyLabel == $label then
+           {spendToday: ([$spent - $b.baseline, 0] | max), since: $b.at, write: null}
+         else
+           {spendToday: 0, since: $now,
+            write: {date: $today, baseline: $spent, keyLabel: $label, at: $now}}
+         end' > "$work/today.json" 2>/dev/null; then
+      if [[ $(jq -c '.write' "$work/today.json" 2>/dev/null) != null ]]; then
+        {
+          tmp=$(mktemp "$state_dir/.today-spend.XXXXXX") \
+            && { jq -c '.write' "$work/today.json" > "$tmp" && chmod 600 -- "$tmp" \
+                   && mv -fT -- "$tmp" "$today_file" || rm -f -- "$tmp"; }
+        } >/dev/null 2>&1 || true
+      fi
+    else
+      printf 'null\n' > "$work/today.json"
+    fi
+  fi
+fi
+
+emit

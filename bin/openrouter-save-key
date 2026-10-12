@@ -1,0 +1,142 @@
+#!/usr/bin/bash -p
+# openrouter-save-key — store an OpenRouter API key for openrouter-credits.
+#
+# Input:  ONE line on stdin (the key; read with a 15 s timeout, so a caller that
+#         never writes fails instead of hanging). All whitespace is stripped.
+#         At most 4096 bytes of that line are read. The key is never taken from
+#         argv, so it never shows in `ps`. Note: bash `read` silently drops NUL
+#         bytes, so "abc<NUL>def" arrives as "abcdef"; a NUL cannot smuggle
+#         anything past the allowlist below, it only joins the two halves.
+# Output: ONE JSON object on stdout, exit status always 0:
+#           {"ok":true,"path":"<absolute path of the key file>"}
+#           {"ok":false,"error":"<reason>"}
+#         Neither form, nor anything on stderr, ever contains the key.
+#         Errors: "No key given" (empty line or EOF), "Timed out waiting for the
+#         key", "That is not a valid OpenRouter key", "HOME is not set",
+#         "The key path is not a regular file", "Refusing a key directory that
+#         is a symlink or not yours: <dir>", "Could not create <dir>",
+#         "Could not write to <dir>", "Could not write the key",
+#         "Could not replace <file>", "jq is not installed".
+#
+# File:   ${XDG_CONFIG_HOME:-~/.config}/haseen/agents/openrouter/key (a relative
+#         XDG_CONFIG_HOME is ignored; with neither it nor HOME absolute -> "HOME
+#         is not set"). It is the third entry in openrouter-credits' key order,
+#         after $OPENROUTER_API_KEY and $OPENROUTER_KEY (a set variable wins over
+#         this file). Content: two `#` comment lines, then the key on its own line.
+#
+# Security rules:
+#   * `bash -p` (shebang) ignores BASH_ENV, ENV, SHELLOPTS, BASHOPTS and
+#     exported functions, so an inherited xtrace or startup hook cannot see the
+#     key; `set +x` and LC_ALL=C (an ASCII-only allowlist in every locale) come
+#     first. $OPENROUTER_API_KEY / $OPENROUTER_KEY and every internal variable
+#     name are unset before any external command, so no child inherits a key.
+#   * The key must match ^[A-Za-z0-9._~+/=-]{16,256}$ (after whitespace
+#     stripping), the same allowlist openrouter-credits enforces; anything else
+#     -> "That is not a valid OpenRouter key" and nothing is written.
+#   * The key directory must not be a symlink and must be owned by the caller;
+#     the key path must be a regular file or absent (a symlink or directory there
+#     is refused, never followed or replaced).
+#   * umask 077: the directory is created mode 700 (an existing one is set to
+#     700) and the file is mode 600 from its first byte. The key is written to a
+#     temp file in the same directory and renamed over the old one with
+#     `mv -fT`, so a reader sees the old key or the new one, never half of
+#     either. The temp file is removed on every failure path.
+#
+# Trust boundaries (what is NOT defended; same wording as openrouter-credits):
+#   * Launch environment: PATH, proxy variables, the CA bundle and CURL_*
+#     variables are trusted (openrouter-credits uses them for the real HTTPS
+#     endpoint); a malicious tool on PATH or an interception CA can see the key.
+#     The loopback test hook bypasses proxies.
+#   * Storage: the key directory must have owner-controlled ancestors. This
+#     helper refuses a symlinked key directory or key path, but
+#     openrouter-credits intentionally READS a key file that is itself a
+#     symlink (the owner's choice). No directory descriptor is held, so a path
+#     swap by something that already controls an ancestor directory is out of
+#     scope.
+#   * Same UID: another process running as this user can read the key file, an
+#     environment-supplied key in /proc/<pid>/environ of the helpers and of
+#     their forked subshells, and this helper's stdin pipe.
+#   * The key is not erased from process memory or core dumps.
+#   * The credits helper's today-baseline label is computed locally from the
+#     key in use ("sk-or-v1-..." + last 4 characters): it detects a key switch,
+#     not account identity.
+#   * A key replaced by hand-editing the key file is not reported as a
+#     replacement to the panel (only a panel save invalidates displayed
+#     figures); the credits helper's baseline does reset, because the local
+#     label changes.
+
+set +x
+export LC_ALL=C
+set -uo pipefail
+umask 077
+
+unset -v OPENROUTER_API_KEY OPENROUTER_KEY raw key status config_home key_dir key_file tmp
+
+readonly KEY_RE='^[A-Za-z0-9._~+/=-]{16,256}$'
+
+command -v jq >/dev/null 2>&1 || {
+  printf '{"ok":false,"error":"jq is not installed"}\n'
+  exit 0
+}
+
+tmp=""
+trap '[[ -n $tmp ]] && rm -f -- "$tmp"' EXIT
+
+emit_fail() {
+  [[ -n $tmp ]] && rm -f -- "$tmp"
+  tmp=""
+  jq -n -c --arg error "$1" '{ok: false, error: $error}'
+  exit 0
+}
+
+# `read` returns on the first newline, so a pasted key with a trailing newline
+# is accepted at once; a final line without one is still taken at EOF. A
+# timeout (status > 128) is a failure even if a partial line arrived.
+raw=""
+IFS= read -r -t 15 -n 4096 raw
+status=$?
+if (( status > 128 )); then
+  emit_fail "Timed out waiting for the key"
+fi
+key=${raw//[[:space:]]/}
+unset -v raw
+
+[[ -n $key ]] || emit_fail "No key given"
+[[ $key =~ $KEY_RE ]] || emit_fail "That is not a valid OpenRouter key"
+
+if [[ ${XDG_CONFIG_HOME:-} == /* ]]; then
+  config_home=$XDG_CONFIG_HOME
+elif [[ ${HOME:-} == /* ]]; then
+  config_home="$HOME/.config"
+else
+  emit_fail "HOME is not set"
+fi
+key_dir="$config_home/haseen/agents/openrouter"
+key_file="$key_dir/key"
+
+if [[ -L $key_dir ]] || { [[ -e $key_dir ]] && [[ ! -O $key_dir ]]; }; then
+  emit_fail "Refusing a key directory that is a symlink or not yours: $key_dir"
+fi
+mkdir -p -- "$key_dir" 2>/dev/null || emit_fail "Could not create $key_dir"
+if [[ -L $key_dir || ! -d $key_dir || ! -O $key_dir ]]; then
+  emit_fail "Refusing a key directory that is a symlink or not yours: $key_dir"
+fi
+chmod 700 -- "$key_dir" 2>/dev/null || emit_fail "Could not create $key_dir"
+if [[ -L $key_file ]] || { [[ -e $key_file ]] && [[ ! -f $key_file ]]; }; then
+  emit_fail "The key path is not a regular file"
+fi
+
+tmp=$(mktemp "$key_dir/.key.XXXXXX" 2>/dev/null) || { tmp=""; emit_fail "Could not write to $key_dir"; }
+if ! {
+  printf '# OpenRouter API key for the t1nk33r.agents bar widget.\n'
+  printf '# Saved from the panel. Comments and blank lines are ignored.\n'
+  printf '%s\n' "$key"
+} > "$tmp" 2>/dev/null; then
+  emit_fail "Could not write the key"
+fi
+chmod 600 -- "$tmp" 2>/dev/null || emit_fail "Could not write the key"
+mv -fT -- "$tmp" "$key_file" 2>/dev/null || emit_fail "Could not replace $key_file"
+tmp=""
+
+jq -n -c --arg path "$key_file" '{ok: true, path: $path}'
+exit 0

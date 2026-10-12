@@ -3,9 +3,10 @@ import Quickshell
 import Quickshell.Io
 
 // The display side of agent usage. All extraction lives behind
-// omarchy-agent-usage-update, which writes one JSON record per agent into
-// the usage directory; this file only discovers those records, watches them
-// for changes, and optionally merges snapshots synced from other machines.
+// bin/agents-update (the packaged omarchy-agent-usage-update plus this
+// plugin's collectors), which writes one JSON record per agent into the usage
+// directory; this file only discovers those records, watches them for
+// changes, and optionally merges snapshots synced from other machines.
 Item {
   id: root
   visible: false
@@ -13,7 +14,16 @@ Item {
   property var settings: ({})
 
   readonly property string home: Quickshell.env("HOME") || ""
-  readonly property string usageDir: (Quickshell.env("XDG_STATE_HOME") || home + "/.local/state") + "/omarchy/agents/usage"
+  readonly property string usageDir: (Quickshell.env("XDG_STATE_HOME") || home + "/.local/state") + "/haseen/agents/usage"
+  readonly property string cacheDir: (Quickshell.env("XDG_CACHE_HOME") || home + "/.cache") + "/haseen/agents"
+  // Wherever the plugin directory is, so bin/ is found without naming it.
+  readonly property string pluginDir: {
+    var url = String(Qt.resolvedUrl("."))
+    if (url.indexOf("file://") === 0) url = url.substring(7)
+    if (url.indexOf("localhost/") === 0) url = url.substring(9)
+    try { url = decodeURIComponent(url) } catch (e) { }
+    return url.replace(/\/+$/, "")
+  }
 
   // ------------------------------------------------------------- discovery
 
@@ -114,7 +124,7 @@ Item {
 
   // -------------------------------------------------------------- refresh
 
-  property int refreshIntervalSec: Math.max(30, Number(setting("refreshIntervalSec", 900)))
+  property int refreshIntervalSec: Math.max(30, Number(setting("refreshIntervalSec", 300)))
   property string pendingUpdateKind: ""
 
   Timer {
@@ -144,8 +154,13 @@ Item {
   }
 
   function updateCommand(kind, agentIds) {
-    var compatBin = home + "/.config/omarchy/plugins/t1nk33r.agents/bin"
-    var command = ["env", "PATH=" + compatBin + ":" + Quickshell.env("PATH"), "omarchy-agent-usage-update"]
+    var compatBin = root.pluginDir + "/bin"
+    // agents-update is this plugin's wrapper around the packaged updater. That
+    // command only discovers collectors in $OMARCHY_PATH/bin, which is
+    // pacman-owned and read-only, so a collector that ships here cannot be
+    // found by it: the wrapper forwards this same argv and then runs the
+    // collectors in bin/. The PATH shim still reaches the packaged codex one.
+    var command = ["env", "PATH=" + compatBin + ":" + Quickshell.env("PATH"), "agents-update"]
     if (kind === "force") command.push("--force")
     if (kind === "limits") command.push("--limits-only")
     var providers = settings && settings.providers ? settings.providers : {}
@@ -292,7 +307,7 @@ Item {
   readonly property string syncEffectiveDir: expandPath(syncDir)
   readonly property string syncEffectiveFileName: safeSnapshotFileName(syncFileName, syncDeviceId)
   readonly property string syncEffectiveDeviceId: safeDeviceId(syncDeviceId || syncEffectiveFileName.replace(/\.json$/i, ""))
-  readonly property string syncSnapshotPath: syncConfigured() ? syncEffectiveDir + "/" + syncEffectiveFileName : home + "/.cache/omarchy/agents-disabled.json"
+  readonly property string syncSnapshotPath: syncConfigured() ? syncEffectiveDir + "/" + syncEffectiveFileName : root.cacheDir + "/agents-disabled.json"
   property var aggregateData: ({})
   property int syncRevision: 0
   property bool syncRunning: false
@@ -585,9 +600,11 @@ Item {
       var snapshotProviders = snapshot.providers || {}
       for (var providerId in snapshotProviders) {
         var stats = snapshotProviders[providerId] || {}
+        if (String(providerId) === "claude" && stats.statsSource !== "omp:anthropic") continue
         var acc = providerAcc(String(providerId))
         acc.devices[device] = true
         if (stats.providerName && acc.providerName === "") acc.providerName = String(stats.providerName)
+        acc.statsSource = String(stats.statsSource || "")
         acc.ready = acc.ready || stats.ready === true
         acc.hasLocalStats = acc.hasLocalStats || stats.hasLocalStats !== false
         // Snapshots from before the field existed only came from agents that
@@ -633,6 +650,7 @@ Item {
       outProviders[id] = {
         providerId: acc.providerId,
         providerName: acc.providerName,
+        statsSource: acc.statsSource,
         ready: acc.ready || providerDevices.length > 0,
         hasLocalStats: acc.hasLocalStats,
         hasPromptStats: acc.hasPromptStats,
@@ -660,12 +678,13 @@ Item {
     }
   }
 
-  // Snapshots keep the field names older Omarchy versions wrote, so a fleet
-  // of machines on mixed versions still merges cleanly in both directions.
+  // Historical source travels with each snapshot: Claude Code snapshots must
+  // never contribute to the OMP-backed Claude provider.
   function providerSnapshot(record) {
     return {
       providerId: String(record.id),
       providerName: String(record.name || record.id),
+      statsSource: String(record.statsSource || ""),
       ready: record.ready === true,
       hasLocalStats: record.hasLocalStats !== false,
       hasPromptStats: record.hasPromptStats !== false,
@@ -702,7 +721,9 @@ Item {
   function syncedStatsFor(providerId) {
     var rev = syncRevision
     if (!syncConfigured() || !aggregateData || !aggregateData.providers) return null
-    return aggregateData.providers[providerId] || null
+    var stats = aggregateData.providers[providerId] || null
+    if (String(providerId) === "claude" && (!stats || stats.statsSource !== "omp:anthropic")) return null
+    return stats
   }
 
   // ---------------------------------------------------------------- format
